@@ -1,0 +1,561 @@
+# %% [markdown]
+# # 顆粒偵測程式 (第一階段)
+#
+# 目的：從一張靜態影像中，找出每一顆顆粒的「質心」與「長短軸」，輸出成 CSV。
+#
+# 整體流程（每一步都會顯示中間影像，方便確認有沒有做對）：
+#   1. 讀圖、裁切 ROI        → 只留下筒倉的部分
+#   2. 取 LAB 的 b 通道      → 把「黃色的顆粒」和「中性色的背景」分開
+#   3. 二值化 (threshold)    → 把顆粒和背景分成白色和黑色
+#   4. 形態學清理            → 去掉雜訊小點
+#   5. 距離轉換              → 找出每顆顆粒的「中心有多深」
+#   6. 取種子點 (markers)    → 每顆顆粒給一個編號
+#   7. 分水嶺 (watershed)    → 從種子往外長，在兩顆交界處停住 → 把黏住的顆粒切開
+#   8. 擬合橢圓 (fitEllipse) → 對每個區域量質心、長短軸、朝向
+#   9. 篩選 → 單位換算 → 疊圖檢查 → 輸出 CSV
+#
+# 在 VSCode 裡安裝 Jupyter 擴充套件後，可以用 `# %%` 分隔的格子逐段執行。
+
+# %%
+# ============================================================
+# 第 0 格：匯入套件 + 所有可調參數集中在這裡
+# ============================================================
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
+from scipy.spatial import cKDTree
+
+# ---------- 輸入輸出 ----------
+IMAGE_PATH = "particle_imagetest_2.JPG"            # 要分析的影像（Windows 路徑記得加 r，例如 r"C:\MyProject\IMG_1234.JPG"）
+OUTPUT_CSV = "particles.csv"      # 輸出的 CSV 檔名
+OUTPUT_OVERLAY = "overlay.png"    # 輸出的檢查圖
+
+# ---------- ROI：只分析筒倉的範圍 ----------
+# 格式 (x_start, y_start, x_end, y_end)；設成 None 代表用整張圖
+# 必須把筒倉外的東西（人、手、木桌）排除掉，
+# 因為它們也是黃色系的，會被 b 通道判成顆粒。
+ROI = (1560, 900, 4680, 3470)
+
+# ---------- 分割通道 ----------
+# "lab_b" = LAB 色彩空間的 b 通道（黃←→藍），對亮度免疫，只看「有多黃」
+# "gray"  = 傳統灰階（只看亮度）
+# 背景有白色磁磚時一定要用 lab_b，否則磁磚會被判成顆粒。
+CHANNEL = "lab_b"
+
+# ---------- 尺度校正 ----------
+# 一顆顆粒的直徑佔多少像素。先隨便填一個值跑一次，
+# 第 10 格會用「最近鄰距離法」算出真實值，再填回來重跑。
+PARTICLE_DIAMETER_PX = 141.0   # 顆粒直徑（像素）
+
+# 【要改】用游標卡尺量一顆顆粒的實際直徑填進來。
+# 這個數字只影響 mm 單位的輸出，不影響偵測本身。
+PARTICLE_DIAMETER_MM = 10.0    # 顆粒直徑（毫米）
+
+# ---------- 分割參數 ----------
+MORPH_KERNEL_SIZE = 3          # 形態學清理用的結構元素大小（像素）
+                               # 【重要】這個值要小。太大會把顆粒之間的縫隙填掉，
+                               # 整堆顆粒會黏成一塊，後面就完全切不開了。
+                               # 實測：3 最好，9 就崩了。
+SEED_RATIO = 0.50              # 種子門檻 = SEED_RATIO × 顆粒半徑
+                               # 實測穩定區間是 0.45~0.70，0.50 在正中間
+
+# ---------- 篩選參數 ----------
+AREA_MIN_RATIO = 0.4           # 面積下限 = AREA_MIN_RATIO × 理論顆粒面積
+AREA_MAX_RATIO = 2.0           # 面積上限 = AREA_MAX_RATIO × 理論顆粒面積
+
+
+# 由上面的參數算出衍生量（之後會用到）
+R_PX = PARTICLE_DIAMETER_PX / 2.0                          # 顆粒半徑（像素）
+PX_PER_MM = PARTICLE_DIAMETER_PX / PARTICLE_DIAMETER_MM    # 每毫米幾像素
+AREA_EXPECTED = np.pi * R_PX ** 2                          # 理論顆粒面積（像素²）
+
+print(f"顆粒半徑 = {R_PX:.1f} px")
+print(f"比例尺   = {PX_PER_MM:.2f} px/mm")
+print(f"理論面積 = {AREA_EXPECTED:.0f} px²")
+
+
+# %%
+# ============================================================
+# 第 0.5 格：設定中文字型
+# ============================================================
+# matplotlib 預設的字型沒有中文字，所以中文標題會顯示成一堆方框「□□□」。
+# 這裡自動從系統裡找一個有中文的字型來用。
+# Windows 通常有「Microsoft JhengHei」(微軟正黑體)，macOS 有「PingFang TC」。
+CJK_FONTS = [
+    "Microsoft JhengHei",   # Windows 繁中
+    "Microsoft YaHei",      # Windows 簡中
+    "PingFang TC",          # macOS 繁中
+    "Heiti TC",             # macOS
+    "Noto Sans CJK TC",     # Linux
+    "Noto Sans CJK SC",
+    "Source Han Sans TW",
+    "SimHei",
+    "Arial Unicode MS",
+]
+
+installed = {f.name for f in font_manager.fontManager.ttflist}
+cjk_font = next((f for f in CJK_FONTS if f in installed), None)
+
+if cjk_font:
+    plt.rcParams["font.family"] = cjk_font
+    plt.rcParams["axes.unicode_minus"] = False   # 避免負號變成方框
+    USE_CHINESE = True
+    print(f"中文字型：{cjk_font}")
+else:
+    USE_CHINESE = False
+    print("找不到中文字型，圖表標題改用英文顯示。")
+
+
+def T(zh, en):
+    """標題用的小工具：有中文字型就用中文，沒有就用英文，避免顯示成方框。"""
+    return zh if USE_CHINESE else en
+
+
+# %%
+# ============================================================
+# 輔助函式
+# ============================================================
+def show(img, title="", cmap="gray", figsize=(10, 8), colorbar=False, cbar_label=""):
+    """把影像顯示出來。彩色圖會自動從 BGR 轉成 RGB。"""
+    plt.figure(figsize=figsize)
+    if img.ndim == 3:
+        im = plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    else:
+        im = plt.imshow(img, cmap=cmap)
+    plt.title(title, fontsize=13)
+    plt.axis("off")
+    if colorbar:
+        cb = plt.colorbar(im, fraction=0.035)
+        cb.set_label(cbar_label)
+    plt.tight_layout()
+    plt.show()
+
+
+def separation(ch):
+    """
+    算「分離度」= 兩群的平均值差 / 平均的群內標準差。
+    這是一個影像品質指標：用 Otsu 把像素分成暗群和亮群，看兩群分得多開。
+    >3 良好、2~3 勉強、<2 代表根本分不開。
+    """
+    b = cv2.GaussianBlur(ch, (5, 5), 0)
+    t, _ = cv2.threshold(b, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    dark, bright = b[b <= t], b[b > t]
+    return (bright.mean() - dark.mean()) / np.sqrt(
+        (dark.std() ** 2 + bright.std() ** 2) / 2
+    )
+
+
+# %%
+# ============================================================
+# 第 1 格：讀圖 + 裁切 ROI
+# ============================================================
+img_full = cv2.imread(IMAGE_PATH)
+if img_full is None:
+    raise FileNotFoundError(f"讀不到影像：{IMAGE_PATH}")
+
+H_full, W_full = img_full.shape[:2]
+print(f"原圖尺寸 (高, 寬, 通道) = {img_full.shape}")
+
+if ROI is None:
+    img = img_full.copy()
+    roi_offset = (0, 0)          # 之後要把座標加回去，所以記下偏移量
+else:
+    x0, y0, x1, y1 = ROI
+
+    # 【防呆】numpy 切片超出範圍時不會報錯，只會回傳空陣列，
+    # 錯誤會拖到好幾步之後才在 cvtColor 爆出來，很難追。所以這裡先擋掉。
+    if x1 > W_full or y1 > H_full or x0 < 0 or y0 < 0 or x0 >= x1 or y0 >= y1:
+        raise ValueError(
+            f"ROI {ROI} 超出影像範圍 (寬={W_full}, 高={H_full})。\n"
+            f"最常見的原因：載入的不是原始解析度的照片"
+            f"（例如經過通訊軟體壓縮、或是截圖）。\n"
+            f"ROI 的座標是給原圖用的，換了縮圖就必須跟著換。"
+        )
+
+    img = img_full[y0:y1, x0:x1].copy()
+    roi_offset = (x0, y0)
+
+print(f"分析範圍尺寸 = {img.shape}")
+show(img, T(f"第 1 步：原始影像（已裁切 ROI，{img.shape[1]}×{img.shape[0]} px）",
+            f"Step 1: Input image (ROI cropped, {img.shape[1]}x{img.shape[0]} px)"))
+
+
+# %%
+# ============================================================
+# 第 2 格：取出要拿來分割的通道
+# ============================================================
+# 【為什麼不用灰階】
+# 背景是「透過透明筒倉看到的白色磁磚牆」，磁磚比顆粒還亮。
+# 用亮度分割的話，磁磚會被判成前景，和顆粒黏成一大塊。
+#
+# 【LAB 的 b 通道為什麼有效】
+# LAB 把顏色拆成三軸：L = 亮度、a = 綠↔紅、b = 藍↔黃。
+# 顆粒是淺棕黃色 → b 值高（約 160）
+# 磁磚、地板、壓克力、金屬螺絲都是中性色 → b 值都在中點 128 附近
+# 所以 b 通道對亮度幾乎免疫，只看「有多黃」，背景再亮也不會被誤判。
+lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+
+if CHANNEL == "lab_b":
+    ch = lab[:, :, 2]            # 索引 2 = b 通道（0 是 L，1 是 a）
+    ch_name = T("LAB 的 b 通道（黃↔藍）", "LAB b channel (yellow-blue)")
+else:
+    ch = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    ch_name = T("灰階（亮度）", "Grayscale (luminance)")
+
+# 把兩種做法的分離度都算出來比較，確認選對通道
+sep_gray = separation(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+sep_labb = separation(lab[:, :, 2])
+print(f"灰階   分離度 = {sep_gray:.2f}")
+print(f"LAB-b  分離度 = {sep_labb:.2f}   ← 數字大的比較好")
+print(f"目前使用：{CHANNEL}")
+print("(分離度 >3 良好, 2~3 勉強, <2 需改善打光或換通道)")
+
+# 注意：這張圖是單通道影像，所以用灰階色階顯示 —— 但它不是「灰階影像」，
+# 而是 b 通道的數值。亮 = 偏黃（顆粒），暗 = 中性色（背景）。
+show(ch, T(f"第 2 步：分割用的通道 = {ch_name}\n（單通道，所以用灰階色階畫；亮=偏黃的顆粒，暗=中性色的背景）",
+           f"Step 2: Segmentation channel = {ch_name}\n(single channel shown in gray colormap; bright = yellowish particles)"))
+
+# 直方圖：如果有「兩個分得開的峰」，代表這張圖好分，
+# Otsu 會切在兩峰之間的谷底，而且閾值稍微飄動也不影響結果。
+plt.figure(figsize=(8, 3.2))
+plt.hist(ch.ravel(), bins=256, range=(0, 256), color="steelblue")
+plt.title(T(f"第 2 步（附圖）：{ch_name} 的數值分佈\n兩個分開的峰 = 背景與顆粒可以切開（分離度 {sep_labb:.2f}）",
+            f"Step 2 (aux): histogram of {ch_name}\nTwo separated peaks = separable (separation {sep_labb:.2f})"),
+          fontsize=11)
+plt.xlabel(T("通道數值 (0~255)", "Channel value (0-255)"))
+plt.ylabel(T("像素個數", "Pixel count"))
+plt.tight_layout()
+plt.show()
+
+
+# %%
+# ============================================================
+# 第 3 格：二值化 —— 把顆粒和背景分開
+# ============================================================
+# 先做一點模糊，把表面的紋理雜訊抹掉，避免二值化後出現很多小洞。
+blur = cv2.GaussianBlur(ch, (5, 5), 0)
+
+# Otsu 方法會自動找出最佳閾值：掃過每個可能的閾值 t，
+# 計算類間變異數 σ²(t) = ω₀ω₁(μ₀-μ₁)²，取最大的那個。
+# 直覺上就是「讓兩群分得最開」的切點，也就是直方圖的谷底。
+thresh_value, binary = cv2.threshold(
+    blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+)
+print(f"Otsu 自動選出的閾值 = {thresh_value:.0f}")
+
+show(binary, T(f"第 3 步：二值化結果（Otsu 自動閾值 = {thresh_value:.0f}）\n白 = 判定為顆粒，黑 = 判定為背景",
+               f"Step 3: Binarised (Otsu threshold = {thresh_value:.0f})\nWhite = particle, Black = background"))
+
+# 【檢查重點】
+# 顆粒要全白、背景要全黑。
+# 如果背景有一塊被判成白色，就要回去收緊 ROI 或換通道。
+
+
+# %%
+# ============================================================
+# 第 4 格：形態學清理 —— 去雜訊
+# ============================================================
+kernel = cv2.getStructuringElement(
+    cv2.MORPH_ELLIPSE, (MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE)
+)
+
+# 開運算 (OPEN) = 先腐蝕再膨脹
+#   腐蝕：刷子要完全蓋在白色區域內，中心才保持白 → 白色縮小一圈
+#   膨脹：刷子碰到任何白色，中心就變白 → 白色擴大一圈
+#   合起來：散落的小白點在腐蝕時就消失了，膨脹救不回來；
+#          大區域先縮後脹回原本大小 → 去雜訊但不改變主體大小
+cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+# 【為什麼這裡不做閉運算 (CLOSE)】
+# 閉運算可以填補顆粒內部的黑洞，看起來很誘人，
+# 但它同時也會把「顆粒之間的縫隙」填掉。
+# 在密集堆積裡那些縫隙很窄，一做閉運算整堆顆粒就黏成一大塊，
+# 後面的距離轉換和分水嶺就完全失效了。
+
+show(cleaned, T(f"第 4 步：形態學開運算後（核大小 {MORPH_KERNEL_SIZE}×{MORPH_KERNEL_SIZE}）\n"
+                f"散落的雜訊白點已去除；重點是顆粒之間的黑色縫隙必須還在",
+                f"Step 4: After morphological opening (kernel {MORPH_KERNEL_SIZE}x{MORPH_KERNEL_SIZE})\n"
+                f"Noise removed; gaps between particles must survive"))
+
+
+# %%
+# ============================================================
+# 第 5 格：距離轉換 —— 分離黏住顆粒的關鍵
+# ============================================================
+# 距離轉換：把每個白色像素換成「它到最近的黑色像素有多遠」
+#   D(p) = min over q in 背景 of ||p - q||
+# 結果是顆粒中心值最大（≈半徑）、邊緣接近 0，
+# 整張圖看起來像「每顆顆粒都是一座小山」。
+dist = cv2.distanceTransform(cleaned, cv2.DIST_L2, 5)
+
+show(dist, T(f"第 5 步：距離轉換（每個像素到最近背景的距離）\n"
+             f"顏色越暖 = 離邊界越遠 = 越接近顆粒中心；最大值 {dist.max():.1f} px，顆粒半徑 {R_PX:.1f} px",
+             f"Step 5: Distance transform\nWarmer = farther from background = particle centre; "
+             f"max {dist.max():.1f} px vs radius {R_PX:.1f} px"),
+     cmap="jet", colorbar=True, cbar_label=T("到背景的距離 (px)", "Distance to background (px)"))
+
+print(f"距離圖最大值 = {dist.max():.1f} px")
+print(f"顆粒半徑設定 = {R_PX:.1f} px")
+
+# 【非常重要的自我檢查】
+# 兩者應該接近。如果距離圖最大值遠大於半徑（例如 2 倍以上），
+# 代表背景和顆粒黏成一大塊了 —— 要回頭檢查 ROI 或通道選擇。
+if dist.max() > 1.5 * R_PX:
+    print("⚠️  距離圖最大值遠大於顆粒半徑，可能有大面積的背景被誤判成前景！")
+
+
+# %%
+# ============================================================
+# 第 6 格：取種子點 —— 每顆顆粒給一個編號
+# ============================================================
+# 只保留距離值夠大的像素，也就是每顆顆粒的正中心那一小塊。
+# 因為顆粒接觸處的距離值很小，用這個門檻一切，相鄰顆粒的中心就分開了。
+seed_threshold = SEED_RATIO * R_PX
+_, sure_fg = cv2.threshold(dist, seed_threshold, 255, cv2.THRESH_BINARY)
+sure_fg = sure_fg.astype(np.uint8)
+
+# connectedComponents 把每一塊獨立的白色區域編號 1, 2, 3...（0 是背景）
+n_seeds, markers = cv2.connectedComponents(sure_fg)
+print(f"種子門檻 = {seed_threshold:.1f} px")
+print(f"找到 {n_seeds - 1} 個種子（= 偵測到的顆粒數）")
+
+show(sure_fg, T(f"第 6 步：種子點（距離 > {seed_threshold:.1f} px 的區域）\n"
+                f"每一塊白色 = 一顆顆粒的中心核心，共 {n_seeds - 1} 塊\n"
+                f"若有白塊明顯比別的大或連在一起，代表那裡有兩顆沒被分開",
+                f"Step 6: Seeds (distance > {seed_threshold:.1f} px)\n"
+                f"Each white blob = one particle core, {n_seeds - 1} total\n"
+                f"An oversized or peanut-shaped blob = two particles merged"))
+
+
+# %%
+# ============================================================
+# 第 7 格：分水嶺 —— 把黏住的顆粒真正切開
+# ============================================================
+# 比喻：把距離圖想成地形（顆粒中心是山頂），每個種子是一個水源，
+# 水往外淹，兩個水源的水碰在一起的地方就是分界線。
+sure_bg = cv2.dilate(cleaned, kernel, iterations=3)   # 膨脹不到的地方一定是背景
+unknown = cv2.subtract(sure_bg, sure_fg)              # 顆粒的邊緣地帶
+
+markers = markers + 1               # 背景變 1、種子變 2 以上
+markers[unknown == 255] = 0         # 未知區設 0
+
+markers = cv2.watershed(img, markers)   # 第一個參數必須是彩色影像
+# 執行後：-1 是分界線，1 是背景，2 以上是各顆顆粒
+
+print(f"分水嶺後的區域標籤範圍：{markers.min()} ~ {markers.max()}")
+
+show(markers, T(f"第 7 步：分水嶺分割結果（共 {markers.max() - 1} 個區域）\n"
+                f"每一個顏色代表一顆獨立的顆粒；最深色的底是背景",
+                f"Step 7: Watershed segmentation ({markers.max() - 1} regions)\n"
+                f"Each colour = one particle; darkest = background"),
+     cmap="nipy_spectral")
+
+
+# %%
+# ============================================================
+# 第 8 格：對每一顆量質心與長短軸
+# ============================================================
+results = []
+
+# 從 2 開始（1 是背景，-1 是分界線）
+for label in range(2, markers.max() + 1):
+
+    mask = np.uint8(markers == label) * 255      # 只有這一顆的遮罩
+
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if len(contours) == 0:
+        continue
+    cnt = max(contours, key=cv2.contourArea)     # 若有碎片，取最大的輪廓
+
+    area = cv2.contourArea(cnt)                  # 鞋帶公式算面積
+
+    if len(cnt) < 5:        # fitEllipse 需要至少 5 個點（二次曲線有 5 個自由度）
+        continue
+
+    # fitEllipse 回傳 ((中心x, 中心y), (軸長1, 軸長2), 角度)
+    # 注意回傳的是「直徑」不是半徑
+    (cx, cy), (axis_w, axis_h), angle = cv2.fitEllipse(cnt)
+
+    # 【角度慣例：這裡很容易寫錯】
+    # OpenCV 回傳的 angle 是「第一個軸長 axis_w」的方向，
+    # 而且不保證 axis_w 就是長軸。
+    # 所以如果長軸其實是第二個 (axis_h)，方向要再轉 90 度。
+    # 驗證方法：畫一個長軸100、短軸40、傾斜30度的合成橢圓，
+    # fitEllipse 回傳 (39.99, 99.78), 119.93 = 30 + 90。
+    # 對圓盤這個錯誤看不出來，但 α≥2 的橢圓會有一半的朝向錯 90 度。
+    if axis_h >= axis_w:
+        major, minor = axis_h, axis_w
+        major_angle = (angle + 90.0) % 180.0
+    else:
+        major, minor = axis_w, axis_h
+        major_angle = angle % 180.0
+
+    results.append({
+        "x_px": cx,
+        "y_px": cy,
+        "major_px": major,
+        "minor_px": minor,
+        "angle_deg": major_angle,   # 長軸相對水平方向的角度 (0~180)
+        "area_px": area,
+    })
+
+df_raw = pd.DataFrame(results)
+print(f"分割出 {len(df_raw)} 個區域（還沒篩選）")
+
+
+# %%
+# ============================================================
+# 第 9 格：篩選掉不合理的區域
+# ============================================================
+# 【面積篩選】分水嶺偶爾會產生很小的碎片或很大的區塊（兩顆沒切開）。
+# 因為顆粒是同一批、尺寸一致，面積應該集中在理論值附近，這個篩選很有效。
+area_min = AREA_MIN_RATIO * AREA_EXPECTED
+area_max = AREA_MAX_RATIO * AREA_EXPECTED
+keep_area = (df_raw["area_px"] >= area_min) & (df_raw["area_px"] <= area_max)
+
+# 【邊緣篩選】碰到畫面邊緣的顆粒被切掉一半，質心和軸長一定是錯的。
+h_roi, w_roi = img.shape[:2]
+margin = R_PX
+keep_edge = (
+    (df_raw["x_px"] > margin) & (df_raw["x_px"] < w_roi - margin) &
+    (df_raw["y_px"] > margin) & (df_raw["y_px"] < h_roi - margin)
+)
+
+df = df_raw[keep_area & keep_edge].copy().reset_index(drop=True)
+
+print(f"面積篩選範圍：{area_min:.0f} ~ {area_max:.0f} px²")
+print(f"面積不合格：{(~keep_area).sum()} 個")
+print(f"碰到邊緣  ：{(~keep_edge).sum()} 個")
+print(f"篩選前 {len(df_raw)} 顆 → 篩選後 {len(df)} 顆")
+
+# 面積分佈：同一批顆粒應該形成一個窄峰
+plt.figure(figsize=(8, 3.2))
+plt.hist(df_raw["area_px"], bins=50, color="steelblue")
+plt.axvline(AREA_EXPECTED, color="green", ls="-", lw=2,
+            label=T("理論面積 πR²", "Expected area"))
+plt.axvline(area_min, color="red", ls="--", lw=1.5,
+            label=T("篩選上下限", "Filter bounds"))
+plt.axvline(area_max, color="red", ls="--", lw=1.5)
+plt.title(T(f"第 9 步（附圖）：各區域的面積分佈\n"
+            f"同一批顆粒應集中成一個窄峰；落在紅線外的 {(~keep_area).sum()} 個會被剔除",
+            f"Step 9 (aux): area distribution\n"
+            f"Should form one narrow peak; {(~keep_area).sum()} outside bounds are rejected"),
+          fontsize=11)
+plt.xlabel(T("區域面積 (px²)", "Region area (px^2)"))
+plt.ylabel(T("區域個數", "Count"))
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# %%
+# ============================================================
+# 第 10 格：尺度自我校正 + 單位換算 + 統計摘要
+# ============================================================
+# 【最近鄰距離法】
+# 在密集接觸的堆積裡，相鄰兩顆的質心距離就等於顆粒直徑。
+# 這給了我們一個不用拿尺量、直接從數據算出比例尺的方法。
+tree = cKDTree(df[["x_px", "y_px"]].values)
+nn_dist = tree.query(df[["x_px", "y_px"]].values, k=2)[0][:, 1]
+D_measured = np.median(nn_dist)
+
+print("=" * 52)
+print("尺度校正")
+print("=" * 52)
+print(f"最近鄰距離中位數 = {D_measured:7.2f} px   ← 這就是真實的顆粒直徑")
+print(f"目前設定的直徑   = {PARTICLE_DIAMETER_PX:7.2f} px")
+if abs(D_measured - PARTICLE_DIAMETER_PX) / D_measured > 0.05:
+    print(f"⚠️  差超過 5%，建議把 PARTICLE_DIAMETER_PX 改成 {D_measured:.1f} 再重跑")
+
+# 加回 ROI 偏移，讓座標相對於原圖（之後和筒倉壁做幾何運算才不會錯）
+df["x_px"] = df["x_px"] + roi_offset[0]
+df["y_px"] = df["y_px"] + roi_offset[1]
+
+# 換算成 mm
+df["x_mm"] = df["x_px"] / PX_PER_MM
+df["y_mm"] = df["y_px"] / PX_PER_MM
+df["major_mm"] = df["major_px"] / PX_PER_MM
+df["minor_mm"] = df["minor_px"] / PX_PER_MM
+
+# 長短軸比：這一欄是你的量測精度指標。
+# 現在是圓盤，真值 = 1.000，偏離多少就是誤差有多大。
+df["aspect_ratio"] = df["major_px"] / df["minor_px"]
+
+print()
+print("=" * 52)
+print(f"量測結果統計（共 {len(df)} 顆）")
+print("=" * 52)
+print(f"{'':16s}{'平均值':>12s}{'標準差':>12s}{'中位數':>12s}")
+for label, col, unit in [
+    ("長軸", "major_px", "px"), ("短軸", "minor_px", "px"),
+]:
+    s = df[col]
+    print(f"{label + ' (' + unit + ')':16s}{s.mean():12.2f}{s.std():12.2f}{s.median():12.2f}")
+for label, col, unit in [
+    ("長軸", "major_mm", "mm"), ("短軸", "minor_mm", "mm"),
+]:
+    s = df[col]
+    print(f"{label + ' (' + unit + ')':16s}{s.mean():12.3f}{s.std():12.3f}{s.median():12.3f}")
+s = df["aspect_ratio"]
+print(f"{'長寬比 α':16s}{s.mean():12.4f}{s.std():12.4f}{s.median():12.4f}")
+
+print()
+print("--- 品質檢查 ---")
+print(f"長寬比真值（圓盤）= 1.0000，量到 {s.mean():.4f} → 系統誤差 {100*(s.mean()-1):.1f}%")
+
+# 長軸方向的集中度：若殘餘誤差是隨機的，集中度應接近 0；
+# 若接近 1，代表整張影像有系統性的幾何變形（透視），要修相機角度。
+m = np.mean(np.exp(2j * np.deg2rad(df["angle_deg"].values)))
+print(f"長軸方向集中度    = {abs(m):.3f}  (接近 0 = 隨機 ✓，接近 1 = 有透視變形 ✗)")
+
+
+# %%
+# ============================================================
+# 第 11 格：畫出檢查圖 —— 用眼睛確認偵測對不對
+# ============================================================
+# 這一步非常重要。所有數字都可能看起來合理但其實是錯的，
+# 只有把偵測結果疊回原圖，才知道程式到底有沒有抓對。
+overlay = img.copy()
+
+# 線寬隨顆粒大小調整，免得顆粒很大時線條細到看不見
+lw = max(2, int(R_PX / 20))
+
+for _, row in df.iterrows():
+    cx = row["x_px"] - roi_offset[0]     # 扣掉偏移才能畫在裁切後的圖上
+    cy = row["y_px"] - roi_offset[1]
+
+    cv2.ellipse(
+        overlay,
+        (int(cx), int(cy)),
+        (int(row["major_px"] / 2), int(row["minor_px"] / 2)),   # 要半軸長
+        row["angle_deg"], 0, 360,       # angle_deg 已統一成「長軸方向」
+        (0, 255, 0), lw
+    )
+    cv2.circle(overlay, (int(cx), int(cy)), lw * 2, (0, 0, 255), -1)
+
+show(overlay, T(f"第 11 步：最終偵測結果（共 {len(df)} 顆）\n"
+                f"綠圈 = 擬合出的橢圓，紅點 = 質心\n"
+                f"平均長軸 {df['major_px'].mean():.1f} px，平均短軸 {df['minor_px'].mean():.1f} px，"
+                f"平均長寬比 {df['aspect_ratio'].mean():.3f}",
+                f"Step 11: Final detection ({len(df)} particles)\n"
+                f"Green = fitted ellipse, Red = centroid\n"
+                f"Mean major {df['major_px'].mean():.1f} px, minor {df['minor_px'].mean():.1f} px, "
+                f"AR {df['aspect_ratio'].mean():.3f}"),
+     figsize=(14, 11))
+cv2.imwrite(OUTPUT_OVERLAY, overlay)
+print(f"檢查圖已存成 {OUTPUT_OVERLAY}")
+
+
+# %%
+# ============================================================
+# 第 12 格：輸出 CSV
+# ============================================================
+cols = ["x_px", "y_px", "major_px", "minor_px", "angle_deg",
+        "x_mm", "y_mm", "major_mm", "minor_mm", "aspect_ratio", "area_px"]
+df[cols].to_csv(OUTPUT_CSV, index=False)
+
+print(f"已輸出 {len(df)} 顆顆粒到 {OUTPUT_CSV}")
