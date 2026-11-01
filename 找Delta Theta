@@ -1,0 +1,1188 @@
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+拱型 δθ 校準程式
+================================================================================
+
+目的
+----
+從 17 張靜止堵塞照片中，對每一張找出「這個拱至少需要多大的 δθ 才能被偵測到」，
+也就是 δθ_min。有了 17 個 δθ_min，任何 δθ 下的「通過拱數」就只是數
+「有幾張的 δθ_min ≤ δθ」而已，不需要真的從 40° 一度一度往下掃。
+
+判定準則（實驗判定準則，不是物理定律）
+----------------------------------------
+條件 A（局部容許條件）：theta_i + δθ > theta_(i+1)
+條件 B（全域凸起條件）：theta_i > theta_(i+2)
+
+把條件 A 移項：δθ > theta_(i+1) - theta_i
+要整條拱每一個 i 都成立，所需最小值就是
+
+    δθ_min = max_i ( theta_(i+1) - theta_i )        ← 若全為負則取 0
+
+【來源註記】這個 δθ_min 的表示式是我從你給的條件 A 直接移項得到的，
+不是 Zhang (2024) 論文原文的寫法，但與論文 Fig.2c 的掃描做法完全等價。
+
+條件 B 完全不含 δθ，所以它是一個「δθ 無關」的 pass/fail。
+違反條件 B 的拱，δθ 開到多大都不會被判定為拱 —— 這點程式會單獨標記出來。
+
+角度序列（含邊界）
+------------------
+設拱中有 n 顆顆粒，由左至右排序，則質心連線角度共 n-1 個。
+納入邊界後的完整序列是：
+
+    S = [ theta_0 , theta_1 , ... , theta_(n-1) , theta_n ]
+        theta_0 = +30°   （左邊界，取筒倉半角）
+        theta_n = -30°   （右邊界）
+
+共 n+1 個角度、n 個相鄰差。theta_i 定義為第 i 顆與第 i+1 顆質心連線
+相對「水平方向」的角度，使用物理座標（原點左下、y 軸向上）。
+
+每張照片的手動步驟（程式會依序提示，每一步都要按 Enter 才會進到下一步）
+----------------------------------------------------------------------
+    [1/4] ROI    ：按住左鍵「拖曳」拉出分析範圍。想重拉就直接再拉一次，新框取代舊框。
+    [2/4] 螺絲   ：點兩顆螺絲中心。點滿會畫出黃色連線並標出 px/mm 與推算出的顆粒直徑。
+    [3/4] 左壁   ：在左側斜壁上點兩點。點滿會畫出延伸到畫面邊界的青色壁線。
+    [4/4] 右壁   ：同上，右側。
+
+共通操作：
+    左鍵  = 選點（ROI 是拖曳）
+    右鍵  = 取消上一個點
+    Enter = 確認，進到下一步（沒點滿不會有作用，標題會提醒）
+    工具列的放大鏡／手掌可縮放平移，縮放中的點擊不會被誤判成選點
+
+為什麼要畫出連線再確認：
+    壁線是「無限長的直線」，觸壁判定用的是點到這條直線的垂直距離。
+    兩點若點得太近，線的角度會歪掉很多，但光看兩個紅十字看不出來，
+    把整條線延伸畫出來才能一眼發現。螺絲連線同理，標出 px/mm 可以
+    馬上看出有沒有點歪（比例尺偏差會直接害顆粒偵測失敗）。
+
+點完的座標會存進 clicks_cache.json，下次重跑同一張不用再點。
+
+輸出
+----
+    arch_results.csv     每張照片一列：n、各 theta、δθ_min、條件 B pass/fail
+    dtheta_curve.csv     δθ 從 0 到 40 每 1°，對應的通過拱數
+    annot/<檔名>_annot.png   標註圖，用眼睛核對有沒有抓錯顆粒
+
+執行方式
+--------
+把這個檔案和 clog_images 資料夾放在同一層，在 VS Code 直接按 Run。
+（如果圖沒有跳出來、或點擊沒反應，見檔案最下方的「疑難排解」）
+================================================================================
+"""
+
+# ============================================================================
+# 第 0 區：匯入套件
+# ============================================================================
+import os
+import json
+import glob
+import heapq                      # 做「最小化最大高度」的路徑搜尋時要用的優先佇列
+
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
+from scipy import ndimage
+
+
+# ============================================================================
+# 第 1 區：所有可調參數都集中在這裡
+# ============================================================================
+
+# ---------- 輸入輸出 ----------
+IMAGE_DIR      = "clog_images"          # 放 17 張照片的資料夾
+IMAGE_EXTS     = ("*.jpg", "*.JPG", "*.jpeg", "*.JPEG", "*.png", "*.PNG")
+OUT_RESULTS    = "arch_results.csv"     # 每張照片一列的結果
+OUT_CURVE      = "dtheta_curve.csv"     # 累積曲線
+OUT_ANNOT_DIR  = "annot"                # 標註圖資料夾
+CLICK_CACHE    = "clicks_cache.json"    # 手點座標的快取
+
+# ---------- 手點相關 ----------
+REDO_CLICKS    = True   # True = 忽略快取，每張都重新點一次
+                         # 如果某一張點錯了，可以直接去 clicks_cache.json 把那一張
+                         # 的那一筆刪掉，再跑一次就只會問那一張。
+
+# 【要改】兩顆螺絲的實際中心距離（mm），用游標卡尺量一次填進來。
+# 這個值決定比例尺 px/mm。
+# 注意：theta 是角度，本身和比例尺無關，所以就算這個值填錯，
+#       δθ_min 也不會變；它只影響顆粒偵測參數和 mm 單位的輸出。
+SCREW_DISTANCE_MM = 49.4
+
+# ---------- 顆粒 ----------
+PARTICLE_DIAMETER_MM = 9.4   # 顆粒直徑（mm）。α=1.0 的圓盤是 φ10 mm。
+                              # 顆粒直徑的像素值會由螺絲比例尺自動算出，不用手填。
+
+# ---------- 筒倉幾何 / 邊界角 ----------
+# 邊界角：把筒倉壁當成「虛擬支撐顆粒」時，序列頭尾補上的兩個角度，
+#         theta_0 = +BOUNDARY_ANGLE_DEG、theta_n = -BOUNDARY_ANGLE_DEG。
+#
+# 【這個值要選哪個，請先看過說明再動】
+#   30 = 筒倉半角（壁與鉛直的夾角）  ← 你目前的定案，程式預設值
+#   60 = 壁與水平的夾角
+#
+# Zhang (2024) 用 theta_0 = +45°、theta_n = -45°，而他的壁與鉛直夾 45°，
+# 壁與水平也正好夾 45°，所以兩種解讀在他那裡數值相同、看不出差別。
+# 你的壁與鉛直夾 30°、與水平夾 60°，兩種解讀就分岔了。
+#
+# 實測影響（用一個理想半圓凸拱測試）：
+#   只看顆粒對顆粒        → 相鄰差全是 -27°，dtheta_min = 0°
+#   邊界取 30°            → 頭尾各多一個 +37.5° 的差，dtheta_min = 37.5°
+#   邊界取 60°            → 頭尾各多一個  +7.5° 的差，dtheta_min =  7.5°
+# 也就是說取 30° 時，dtheta_min 幾乎完全由邊界項決定，蓋掉顆粒本身的資訊。
+#
+# 為了讓你一次跑完就能判斷，程式會同時輸出三種口徑（見 evaluate_arch）：
+#   dtheta_min_deg        含邊界，用 BOUNDARY_ANGLE_DEG 這個值
+#   dtheta_min_alt_deg    含邊界，用 BOUNDARY_ANGLE_ALT_DEG 這個值
+#   dtheta_min_inner_deg  完全排除邊界項，只看顆粒對顆粒
+BOUNDARY_ANGLE_DEG     = 30.0   # 主要口徑（目前的定案值）
+BOUNDARY_ANGLE_ALT_DEG = 60.0   # 對照口徑，只用來多輸出一欄供比較，不影響主要結果
+
+# ---------- 分割參數（沿用你原本驗證過的值）----------
+CHANNEL           = "lab_b"   # "lab_b" = LAB 的 b 通道（黃↔藍），對亮度免疫
+MORPH_KERNEL_SIZE = 3         # 形態學核大小。要小，太大會把顆粒間縫隙填掉
+SEED_RATIO        = 0.50      # 種子門檻 = SEED_RATIO × 顆粒半徑
+AREA_MIN_RATIO    = 0.4       # 面積下限 = 比例 × 理論顆粒面積
+AREA_MAX_RATIO    = 2.0       # 面積上限
+
+# ---------- 接觸判定參數 ----------
+# 用 watershed 標籤相鄰法判接觸，但再加一道「質心距離」的濾網，
+# 避免兩顆隔著縫隙卻共用一條分水嶺線時被誤判成接觸。
+CONTACT_DIST_RATIO = 1.30     # 質心距離上限 = 比例 × 顆粒直徑
+CONTACT_MIN_PIXELS = 8        # 兩個標籤相鄰的邊界像素數下限，濾掉只碰到一個角的情形
+
+# ---------- 觸壁判定參數 ----------
+WALL_TOUCH_RATIO = 0.85       # 質心到壁線的垂直距離 < 比例 × 顆粒直徑 → 視為觸壁
+                              # （理想接觸時距離 = 半徑 = 0.5 直徑，放寬到 0.85 容納誤差）
+
+# ---------- 鏈搜尋 ----------
+ENFORCE_X_MONOTONIC = False   # True = 只允許 x 遞增的接觸邊（嚴格由左到右）
+                              # False = 不限制，但若找到的路徑 x 非單調會發出警告
+
+# ---------- δθ 掃描範圍（只影響輸出的累積曲線，不影響 δθ_min 的計算）----------
+DTHETA_SCAN = np.arange(0.0, 40.0 + 0.5, 1.0)   # 0° 到 40°，每 1°
+
+
+# ============================================================================
+# 第 2 區：中文字型設定（避免標題顯示成方框）
+# ============================================================================
+CJK_FONTS = [
+    "Microsoft JhengHei", "Microsoft YaHei", "PingFang TC", "Heiti TC",
+    "Noto Sans CJK TC", "Noto Sans CJK SC", "Source Han Sans TW",
+    "SimHei", "Arial Unicode MS",
+]
+_installed = {f.name for f in font_manager.fontManager.ttflist}
+_cjk = next((f for f in CJK_FONTS if f in _installed), None)
+if _cjk:
+    plt.rcParams["font.family"] = _cjk
+    plt.rcParams["axes.unicode_minus"] = False
+    USE_CHINESE = True
+else:
+    USE_CHINESE = False
+
+
+def T(zh, en):
+    """有中文字型就用中文、沒有就用英文，避免標題變方框。"""
+    return zh if USE_CHINESE else en
+
+
+# ============================================================================
+# 第 3 區：互動點擊的工具
+# ============================================================================
+
+def draw_extended_line(ax, p1, p2, color="cyan", lw=2.0, ls="-"):
+    """
+    畫一條「通過 p1、p2 兩點並往兩側延伸到畫面邊界」的直線。
+
+    為什麼要延伸：觸壁判定用的是「點到直線的垂直距離」，用的是整條無限長的直線，
+    不是你點的那兩點之間的線段。把它延伸畫出來，你才看得到程式實際認定的壁在哪，
+    才能判斷壁線角度有沒有歪掉。
+
+    回傳畫出來的 artist，方便之後移除。
+    """
+    (x1, y1), (x2, y2) = p1, p2
+    dx, dy = x2 - x1, y2 - y1
+    norm = np.hypot(dx, dy)
+    if norm < 1e-9:
+        return None
+    dx, dy = dx / norm, dy / norm          # 單位方向向量
+
+    # 以目前畫面大小為基準，往兩側各延伸一個足夠大的距離
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    big = 3.0 * (abs(xlim[1] - xlim[0]) + abs(ylim[1] - ylim[0]))
+
+    xs = [x1 - dx * big, x1 + dx * big]
+    ys = [y1 - dy * big, y1 + dy * big]
+
+    art, = ax.plot(xs, ys, color=color, linewidth=lw, linestyle=ls, alpha=0.9)
+
+    # 延伸線會把座標軸範圍撐大，所以畫完要把範圍設回原本的影像大小
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    return art
+
+
+class ClickCollector:
+    """
+    在一張圖上收集指定數量的滑鼠點擊，點滿後「等你按 Enter 確認」才結束。
+
+    為什麼不直接用 plt.ginput：
+      ginput 會把「使用工具列縮放/平移時的點擊」也算成一次有效點擊，
+      而這些照片很大、常常需要先放大才看得清楚螺絲，所以必須自己擋掉。
+      這個類別會檢查工具列目前是不是在 zoom/pan 模式，是的話就忽略那次點擊。
+
+    操作方式：
+        左鍵  = 選一個點
+        右鍵  = 取消上一個點
+        Enter = 確認並進入下一步（必須點滿指定數量才有作用）
+
+    preview_fn：
+        一個可選的函式，簽名是 preview_fn(ax, points) -> list of artists。
+        每次點擊後若已點滿，就呼叫它把「兩點連成的線」之類的預覽畫出來，
+        讓你在按 Enter 前先確認。回傳的 artists 會在下次更新時自動清掉。
+    """
+
+    def __init__(self, ax, n_points, label, preview_fn=None):
+        self.ax = ax                    # 要在哪個座標軸上收集點擊
+        self.n_points = n_points        # 需要收集幾個點
+        self.label = label              # 提示文字，顯示在標題上
+        self.preview_fn = preview_fn    # 點滿時用來畫預覽的函式
+        self.points = []                # 已收集到的點，每個是 (x, y)
+        self.markers = []               # 畫在圖上的紅色十字，供反悔時移除
+        self.preview_artists = []       # 預覽用的線，每次更新都重畫
+        self.confirmed = False          # 是否已按 Enter 確認
+
+    def _toolbar_active(self):
+        """回傳工具列是不是正在 zoom 或 pan 模式。"""
+        tb = self.ax.figure.canvas.toolbar
+        # 不同 matplotlib 版本屬性名稱不同，用 getattr 保險
+        mode = getattr(tb, "mode", "")
+        return bool(str(mode).strip())
+
+    def _on_click(self, event):
+        """每次按下滑鼠鍵時被呼叫。"""
+        if event.inaxes is not self.ax:      # 點在圖外（例如工具列）→ 忽略
+            return
+        if self._toolbar_active():           # 正在縮放/平移 → 忽略
+            return
+
+        if event.button == 3:                # 右鍵 = 取消上一個點
+            if self.points:
+                self.points.pop()
+                self.markers.pop().remove()
+                self._refresh()
+            return
+
+        if event.button != 1:                # 只收左鍵
+            return
+        if len(self.points) >= self.n_points:
+            # 已經點滿了，多餘的左鍵忽略，避免不小心多點
+            return
+
+        self.points.append((event.xdata, event.ydata))
+        # 畫一個紅色十字標記，讓你看得到點在哪
+        m, = self.ax.plot(event.xdata, event.ydata, "r+",
+                          markersize=18, markeredgewidth=2.5)
+        self.markers.append(m)
+        self._refresh()
+
+    def _on_key(self, event):
+        """按鍵事件：只處理 Enter。"""
+        if event.key not in ("enter", "return"):
+            return
+        if len(self.points) < self.n_points:
+            # 還沒點滿就按 Enter，提醒一下但不關閉
+            self._refresh(warn=True)
+            return
+        self.confirmed = True
+        plt.close(self.ax.figure)
+
+    def _refresh(self, warn=False):
+        """清掉舊預覽、重畫新預覽、更新標題。"""
+        # 先移除上一輪的預覽線
+        for a in self.preview_artists:
+            try:
+                a.remove()
+            except Exception:
+                pass
+        self.preview_artists = []
+
+        # 點滿了就畫預覽，讓你在按 Enter 前確認
+        if self.preview_fn is not None and len(self.points) == self.n_points:
+            arts = self.preview_fn(self.ax, self.points)
+            self.preview_artists = [a for a in (arts or []) if a is not None]
+
+        done = len(self.points) == self.n_points
+        if warn:
+            tip = T(f"⚠ 還沒點滿（需要 {self.n_points} 點）",
+                    f"Not enough points (need {self.n_points})")
+        elif done:
+            tip = T("✓ 已點滿，確認無誤請按 Enter（右鍵可取消重點）",
+                    "Ready - press Enter to confirm (right-click to undo)")
+        else:
+            tip = T("左鍵=選點，右鍵=取消；工具列可縮放",
+                    "left=pick, right=undo; toolbar to zoom")
+
+        self.ax.set_title(f"{self.label}   [{len(self.points)}/{self.n_points}]\n{tip}",
+                          fontsize=12)
+        self.ax.figure.canvas.draw_idle()
+
+    def run(self):
+        """開始收集，阻塞直到按 Enter 確認或視窗被關閉。回傳點的 list。"""
+        self._refresh()
+        cid1 = self.ax.figure.canvas.mpl_connect("button_press_event", self._on_click)
+        cid2 = self.ax.figure.canvas.mpl_connect("key_press_event", self._on_key)
+        plt.show(block=True)
+        for cid in (cid1, cid2):
+            try:
+                self.ax.figure.canvas.mpl_disconnect(cid)
+            except Exception:
+                pass
+        return self.points
+
+
+def collect_points(img_bgr, n_points, label, preview_fn=None, figsize=(13, 10)):
+    """
+    開一個視窗顯示影像，收集 n_points 個點擊，按 Enter 確認後回傳 [(x,y), ...]。
+    座標是「原圖的像素座標」，因為 imshow 用的就是原圖。
+
+    preview_fn 會在點滿時被呼叫，用來畫出連線供你確認。
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    ax.set_axis_off()
+    fig.tight_layout()
+    pts = ClickCollector(ax, n_points, label, preview_fn=preview_fn).run()
+    if len(pts) < n_points:
+        raise RuntimeError(f"只收到 {len(pts)} 個點，需要 {n_points} 個。視窗被提早關閉了。")
+    return pts
+
+
+def preview_wall(ax, pts):
+    """
+    筒倉壁的預覽：把通過兩點的『整條直線』延伸畫出來。
+    這條線就是程式之後拿來算「點到壁距離」用的那一條。
+    """
+    arts = []
+    line = draw_extended_line(ax, pts[0], pts[1], color="cyan", lw=2.2)
+    if line is not None:
+        arts.append(line)
+    # 把你點的兩點用青色圓圈再標一次，和紅色十字區隔
+    a, = ax.plot([pts[0][0], pts[1][0]], [pts[0][1], pts[1][1]],
+                 "o", color="cyan", markersize=9, markerfacecolor="none",
+                 markeredgewidth=2, linestyle="none")
+    arts.append(a)
+    return arts
+
+
+def preview_screw(ax, pts):
+    """
+    螺絲的預覽：把兩顆螺絲之間的『線段』畫出來，並標上像素長度與換算出的比例尺。
+    這裡畫線段而不是無限延伸線，因為用到的是兩點之間的距離，不是一條直線。
+    """
+    (x1, y1), (x2, y2) = pts
+    d_px = np.hypot(x2 - x1, y2 - y1)
+    px_per_mm = d_px / SCREW_DISTANCE_MM if SCREW_DISTANCE_MM > 0 else float("nan")
+
+    arts = []
+    a, = ax.plot([x1, x2], [y1, y2], "-", color="yellow", linewidth=2.2)
+    arts.append(a)
+    b, = ax.plot([x1, x2], [y1, y2], "o", color="yellow", markersize=9,
+                 markerfacecolor="none", markeredgewidth=2, linestyle="none")
+    arts.append(b)
+
+    # 在線段中點標出量到的長度，方便你一眼看出有沒有點歪
+    t = ax.text((x1 + x2) / 2, (y1 + y2) / 2,
+                f"{d_px:.1f} px = {SCREW_DISTANCE_MM:.1f} mm\n"
+                f"{px_per_mm:.3f} px/mm\n"
+                f"→ {T('顆粒直徑', 'particle dia')} {PARTICLE_DIAMETER_MM * px_per_mm:.1f} px",
+                color="yellow", fontsize=10, ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.3", fc="black", alpha=0.7))
+    arts.append(t)
+    return arts
+
+
+class RectSelectorBox:
+    """
+    用拖曳的方式framing一個矩形 ROI，拖完按 Enter 確認。
+
+    操作方式：
+        按住左鍵拖曳 = 拉出一個框（想重拉就直接再拉一次，新框取代舊框）
+        Enter        = 確認
+
+    用 matplotlib 內建的 RectangleSelector。它和工具列的縮放/平移可以並存，
+    但同樣要擋掉「縮放模式下的拖曳」，否則一邊縮放一邊會拉出假的框。
+    """
+
+    def __init__(self, ax, label):
+        self.ax = ax
+        self.label = label
+        self.extents = None       # (xmin, xmax, ymin, ymax)
+        self.confirmed = False
+        self.selector = None
+
+    def _toolbar_active(self):
+        tb = self.ax.figure.canvas.toolbar
+        return bool(str(getattr(tb, "mode", "")).strip())
+
+    def _on_select(self, eclick, erelease):
+        """拖曳放開時被呼叫，記下框的範圍。"""
+        if self._toolbar_active():
+            return
+        x0, x1 = sorted([eclick.xdata, erelease.xdata])
+        y0, y1 = sorted([eclick.ydata, erelease.ydata])
+        # 太小的框當成誤觸，忽略
+        if (x1 - x0) < 10 or (y1 - y0) < 10:
+            return
+        self.extents = (x0, x1, y0, y1)
+        self._refresh()
+
+    def _on_key(self, event):
+        if event.key not in ("enter", "return"):
+            return
+        if self.extents is None:
+            self._refresh(warn=True)
+            return
+        self.confirmed = True
+        plt.close(self.ax.figure)
+
+    def _refresh(self, warn=False):
+        if warn:
+            tip = T("⚠ 還沒拉出任何框", "No rectangle drawn yet")
+        elif self.extents is not None:
+            x0, x1, y0, y1 = self.extents
+            tip = T(f"✓ 目前範圍 {int(x1-x0)}×{int(y1-y0)} px，"
+                    f"確認請按 Enter（想重拉就直接再拉一次）",
+                    f"Current {int(x1-x0)}x{int(y1-y0)} px - Enter to confirm "
+                    f"(drag again to redo)")
+        else:
+            tip = T("按住左鍵拖曳拉出框", "Drag with left button to draw a box")
+        self.ax.set_title(f"{self.label}\n{tip}", fontsize=12)
+        self.ax.figure.canvas.draw_idle()
+
+    def run(self):
+        """開始拖曳選取，阻塞直到按 Enter 確認。回傳 (x0, y0, x1, y1)。"""
+        from matplotlib.widgets import RectangleSelector
+
+        self._refresh()
+        # interactive=True 讓拉出來的框可以再用拖把手微調
+        self.selector = RectangleSelector(
+            self.ax, self._on_select,
+            useblit=False,                 # 關掉 blit，框才會穩定留在畫面上
+            button=[1],                    # 只吃左鍵
+            minspanx=5, minspany=5,
+            spancoords="pixels",
+            interactive=True,
+            props=dict(facecolor="red", edgecolor="red",
+                       alpha=0.18, fill=True, linewidth=2),
+        )
+        cid = self.ax.figure.canvas.mpl_connect("key_press_event", self._on_key)
+        plt.show(block=True)
+        try:
+            self.ax.figure.canvas.mpl_disconnect(cid)
+        except Exception:
+            pass
+
+        if self.extents is None:
+            raise RuntimeError("沒有拉出任何 ROI 框，視窗被提早關閉了。")
+        x0, x1, y0, y1 = self.extents
+        return int(x0), int(y0), int(x1), int(y1)
+
+
+def select_roi(img_bgr, label, figsize=(13, 10)):
+    """開一個視窗，用拖曳的方式選 ROI，按 Enter 確認。回傳 [x0, y0, x1, y1]。"""
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    ax.set_axis_off()
+    fig.tight_layout()
+    return list(RectSelectorBox(ax, label).run())
+
+
+def get_clicks_for_image(img_bgr, img_name, cache):
+    """
+    取得一張照片所需的全部手點資料。
+    若快取裡已經有這張，就直接用快取；否則依序請你點四組。
+
+    回傳一個 dict：
+        roi        = [x0, y0, x1, y1]           分析範圍
+        screws     = [[x,y], [x,y]]             兩顆螺絲
+        wall_left  = [[x,y], [x,y]]             左壁上兩點
+        wall_right = [[x,y], [x,y]]             右壁上兩點
+    """
+    if (not REDO_CLICKS) and (img_name in cache):
+        return cache[img_name]
+
+    print(f"\n--- 請在跳出的視窗上點選：{img_name} ---")
+
+    # (1) ROI：用拖曳的方式拉一個框，按 Enter 確認
+    print("  [1/4] ROI：按住左鍵拖曳拉出分析範圍，確認後按 Enter")
+    roi = select_roi(img_bgr,
+                     T("[1/4] ROI：拖曳拉出分析範圍",
+                       "[1/4] ROI: drag to select the analysis area"))
+
+    # (2) 螺絲：兩顆，用來建立比例尺。點滿會畫出連線與換算結果供確認
+    print(f"  [2/4] 螺絲：點兩顆螺絲的中心（實際距離設定為 {SCREW_DISTANCE_MM} mm），"
+          f"確認連線後按 Enter")
+    screws = collect_points(
+        img_bgr, 2,
+        T(f"[2/4] 點兩顆螺絲中心（相距 {SCREW_DISTANCE_MM} mm）",
+          f"[2/4] Click two screw centres ({SCREW_DISTANCE_MM} mm apart)"),
+        preview_fn=preview_screw)
+
+    # (3)(4) 筒倉壁：各點兩點決定一條直線。點滿會把延伸後的整條壁線畫出來供確認
+    print("  [3/4] 左筒倉壁：在左側斜壁上點兩點（盡量分開，角度才準），確認壁線後按 Enter")
+    wl = collect_points(img_bgr, 2,
+                        T("[3/4] 左筒倉壁：點兩點", "[3/4] Left wall: two points"),
+                        preview_fn=preview_wall)
+    print("  [4/4] 右筒倉壁：在右側斜壁上點兩點，確認壁線後按 Enter")
+    wr = collect_points(img_bgr, 2,
+                        T("[4/4] 右筒倉壁：點兩點", "[4/4] Right wall: two points"),
+                        preview_fn=preview_wall)
+
+    rec = {
+        "roi": roi,
+        "screws": [list(map(float, screws[0])), list(map(float, screws[1]))],
+        "wall_left": [list(map(float, wl[0])), list(map(float, wl[1]))],
+        "wall_right": [list(map(float, wr[0])), list(map(float, wr[1]))],
+    }
+    cache[img_name] = rec
+    # 每點完一張就存檔，中途當掉也不會全部白點
+    with open(CLICK_CACHE, "w", encoding="utf-8-sig") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+    return rec
+
+
+# ============================================================================
+# 第 4 區：顆粒偵測（沿用你原本的 LAB-b + watershed 流程）
+# ============================================================================
+
+def detect_particles(img_roi, diameter_px):
+    """
+    從裁切後的 ROI 影像中偵測顆粒。
+
+    參數：
+        img_roi     = 裁切後的彩色影像（BGR）
+        diameter_px = 顆粒直徑（像素），由螺絲比例尺算出
+
+    回傳：
+        df      = DataFrame，欄位 x_px, y_px, major_px, minor_px, angle_deg, area_px, label
+                  座標是「ROI 內」的影像座標（原點左上、y 向下）
+        markers = watershed 的標籤陣列，之後判接觸要用
+    """
+    r_px = diameter_px / 2.0
+    area_expected = np.pi * r_px ** 2
+
+    # --- 取出分割用的通道 ---
+    # LAB 把顏色拆成 L(亮度)、a(綠↔紅)、b(藍↔黃)。顆粒是淺棕黃色 → b 值高；
+    # 壓克力、螺絲、磁磚都是中性色 → b 值在中點 128 附近。所以 b 通道對亮度免疫。
+    lab = cv2.cvtColor(img_roi, cv2.COLOR_BGR2LAB)
+    ch = lab[:, :, 2] if CHANNEL == "lab_b" else cv2.cvtColor(img_roi, cv2.COLOR_BGR2GRAY)
+
+    # --- 二值化 ---
+    blur = cv2.GaussianBlur(ch, (5, 5), 0)
+    _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # --- 形態學開運算去雜訊（不做閉運算，否則顆粒間縫隙會被填掉）---
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                       (MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE))
+    cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # --- 距離轉換：每個白像素換成「到最近黑像素的距離」，顆粒中心值最大 ---
+    dist = cv2.distanceTransform(cleaned, cv2.DIST_L2, 5)
+
+    # --- 取種子：只留距離值夠大的核心，相鄰顆粒的核心就此分開 ---
+    _, sure_fg = cv2.threshold(dist, SEED_RATIO * r_px, 255, cv2.THRESH_BINARY)
+    sure_fg = sure_fg.astype(np.uint8)
+    _, markers = cv2.connectedComponents(sure_fg)
+
+    # --- 分水嶺：從種子往外淹，兩個水源相碰處就是分界 ---
+    sure_bg = cv2.dilate(cleaned, kernel, iterations=3)
+    unknown = cv2.subtract(sure_bg, sure_fg)
+    markers = markers + 1          # 背景變 1、種子變 2 以上
+    markers[unknown == 255] = 0    # 未知區設 0
+    markers = cv2.watershed(img_roi, markers)   # 執行後 -1=分界線, 1=背景, >=2=顆粒
+
+    # --- 對每個標籤擬合橢圓，量質心與長短軸 ---
+    rows = []
+    for label in range(2, markers.max() + 1):
+        mask = np.uint8(markers == label) * 255
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) == 0:
+            continue
+        cnt = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(cnt)
+        if len(cnt) < 5:           # fitEllipse 至少需要 5 個點
+            continue
+
+        (cx, cy), (aw, ah), ang = cv2.fitEllipse(cnt)
+        # OpenCV 不保證第一個軸長就是長軸，若長軸是第二個則方向要再轉 90°
+        if ah >= aw:
+            major, minor, major_angle = ah, aw, (ang + 90.0) % 180.0
+        else:
+            major, minor, major_angle = aw, ah, ang % 180.0
+
+        rows.append({"label": label, "x_px": cx, "y_px": cy,
+                     "major_px": major, "minor_px": minor,
+                     "angle_deg": major_angle, "area_px": area})
+
+    df = pd.DataFrame(rows)
+    if len(df) == 0:
+        return df, markers
+
+    # --- 面積篩選：同一批顆粒尺寸一致，面積應集中在理論值附近 ---
+    keep = ((df["area_px"] >= AREA_MIN_RATIO * area_expected) &
+            (df["area_px"] <= AREA_MAX_RATIO * area_expected))
+    df = df[keep].copy().reset_index(drop=True)
+
+    return df, markers
+
+
+def build_contact_graph(df, markers, diameter_px):
+    """
+    建立接觸網路。方法是「watershed 標籤相鄰法」：
+    兩顆顆粒的分水嶺區域若在影像上緊鄰，就認定它們接觸。
+
+    因為 watershed 會在區域之間留下 -1 的分界線，直接比對鄰居像素會被分界線擋住，
+    所以先把 -1 的像素用「最近的有效標籤」填回去，再比對上下左右鄰居。
+
+    另外加兩道濾網避免誤判：
+      (a) 相鄰的邊界像素數必須 >= CONTACT_MIN_PIXELS（濾掉只碰到一個角）
+      (b) 兩顆質心距離必須 < CONTACT_DIST_RATIO × 顆粒直徑（濾掉隔著縫隙的）
+
+    回傳：adjacency = {顆粒索引: set(相鄰顆粒索引)}
+    """
+    valid_labels = set(df["label"].tolist())
+    label_to_idx = {lab: i for i, lab in enumerate(df["label"].tolist())}
+
+    # --- 把 -1（分界線）和 0（未知）用最近的有效像素填掉 ---
+    m = markers.copy()
+    invalid = (m <= 1)                       # <=1 表示背景或分界線
+    # distance_transform_edt 的 return_indices 會告訴我們「最近的 False 像素在哪」
+    _, idx = ndimage.distance_transform_edt(invalid, return_indices=True)
+    filled = m[idx[0], idx[1]]               # 每個像素換成最近的有效標籤
+
+    # --- 統計相鄰的邊界像素數 ---
+    pair_count = {}
+
+    def count_pairs(a, b):
+        """比較兩個錯開一格的標籤陣列，把不同標籤的配對記下來。"""
+        diff = (a != b) & (a >= 2) & (b >= 2)
+        if not diff.any():
+            return
+        la = a[diff].ravel()
+        lb = b[diff].ravel()
+        for p, q in zip(la, lb):
+            if p in valid_labels and q in valid_labels:
+                key = (p, q) if p < q else (q, p)
+                pair_count[key] = pair_count.get(key, 0) + 1
+
+    count_pairs(filled[:, :-1], filled[:, 1:])   # 左右鄰居
+    count_pairs(filled[:-1, :], filled[1:, :])   # 上下鄰居
+
+    # --- 套用兩道濾網，建出鄰接表 ---
+    xs = df["x_px"].values
+    ys = df["y_px"].values
+    adjacency = {i: set() for i in range(len(df))}
+    dist_max = CONTACT_DIST_RATIO * diameter_px
+
+    for (p, q), cnt in pair_count.items():
+        if cnt < CONTACT_MIN_PIXELS:
+            continue
+        i, j = label_to_idx[p], label_to_idx[q]
+        d = np.hypot(xs[i] - xs[j], ys[i] - ys[j])
+        if d > dist_max:
+            continue
+        adjacency[i].add(j)
+        adjacency[j].add(i)
+
+    return adjacency
+
+
+# ============================================================================
+# 第 5 區：找出「最下面的那條鏈」
+# ============================================================================
+
+def point_line_distance(px, py, p1, p2):
+    """計算點 (px,py) 到通過 p1、p2 兩點的『直線』的垂直距離。"""
+    (x1, y1), (x2, y2) = p1, p2
+    dx, dy = x2 - x1, y2 - y1
+    norm = np.hypot(dx, dy)
+    if norm < 1e-9:
+        return np.hypot(px - x1, py - y1)
+    # 用外積除以線段長度，就是點到直線的垂直距離
+    return abs(dy * (px - x1) - dx * (py - y1)) / norm
+
+
+def find_lowest_chain(df, adjacency, wall_left, wall_right, diameter_px):
+    """
+    在接觸網路中找出「兩端都觸壁、而且位置最低」的那一條鏈，當作拱。
+
+    「最低」的定義：這條鏈上『最高的那一顆』要盡可能低。
+    也就是最小化路徑上的最大高度（bottleneck / minimax path），
+    用一個改過的 Dijkstra 就能解：
+        把每條路徑的成本定義成「路徑上所有顆粒的最大影像 y 值」
+        （影像座標 y 向下，所以 y 越大代表位置越低；要取『最低的鏈』
+          就是最小化路徑上的『最小 y』…… 為避免混淆，這裡統一轉成
+          物理高度 h = -y，最低的鏈 = 最小化路徑上的 max(h)）
+
+    回傳：
+        path = [顆粒索引, ...]，由左壁端排到右壁端；找不到則回傳 None
+        info = 說明字串
+    """
+    n = len(df)
+    if n == 0:
+        return None, "沒有偵測到任何顆粒"
+
+    xs = df["x_px"].values
+    ys = df["y_px"].values
+    h = -ys                      # 物理高度（y 軸向上）
+
+    # --- 判斷哪些顆粒觸壁 ---
+    touch_max = WALL_TOUCH_RATIO * diameter_px
+    left_nodes, right_nodes = [], []
+    for i in range(n):
+        if point_line_distance(xs[i], ys[i], wall_left[0], wall_left[1]) < touch_max:
+            left_nodes.append(i)
+        if point_line_distance(xs[i], ys[i], wall_right[0], wall_right[1]) < touch_max:
+            right_nodes.append(i)
+
+    if not left_nodes:
+        return None, "沒有顆粒被判定為接觸左壁（可考慮調大 WALL_TOUCH_RATIO）"
+    if not right_nodes:
+        return None, "沒有顆粒被判定為接觸右壁（可考慮調大 WALL_TOUCH_RATIO）"
+
+    right_set = set(right_nodes)
+
+    # --- minimax Dijkstra ---
+    # best[i] = 從任一左壁顆粒走到 i，所能達成的「路徑最大高度」的最小值
+    INF = float("inf")
+    best = [INF] * n
+    prev = [-1] * n
+    pq = []
+    for s in left_nodes:
+        if h[s] < best[s]:
+            best[s] = h[s]
+            heapq.heappush(pq, (h[s], s))
+
+    goal = -1
+    while pq:
+        cost, u = heapq.heappop(pq)
+        if cost > best[u]:
+            continue
+        if u in right_set:
+            goal = u
+            break
+        for v in adjacency[u]:
+            if ENFORCE_X_MONOTONIC and xs[v] <= xs[u]:
+                continue                      # 只允許往右走
+            nc = max(cost, h[v])              # 路徑成本 = 一路上的最大高度
+            if nc < best[v]:
+                best[v] = nc
+                prev[v] = u
+                heapq.heappush(pq, (nc, v))
+
+    if goal < 0:
+        return None, "接觸網路中找不到連接左右兩壁的路徑（可能有顆粒漏偵測，請看標註圖）"
+
+    # --- 回溯路徑 ---
+    path = []
+    cur = goal
+    while cur != -1:
+        path.append(cur)
+        cur = prev[cur]
+    path.reverse()               # 現在是「左壁端 → 右壁端」
+
+    # --- 檢查 x 是否單調遞增 ---
+    px = xs[path]
+    info = ""
+    if not np.all(np.diff(px) > 0):
+        info = "警告：這條鏈的 x 座標不是單調遞增，請看標註圖確認是否抓錯顆粒"
+
+    return path, info
+
+
+# ============================================================================
+# 第 6 區：角度計算與判定
+# ============================================================================
+
+def compute_inner_thetas(df, path):
+    """
+    計算拱中「顆粒對顆粒」的質心連線角度 theta_i，不含邊界角。
+
+    座標轉換：影像座標 y 向下、原點左上；物理座標 y 向上。
+    所以 theta = atan2( -(y_{i+1} - y_i) , x_{i+1} - x_i )，
+    前面那個負號就是在把影像座標翻成物理座標。
+
+    n 顆顆粒會得到 n-1 個角度。
+    """
+    xs = df["x_px"].values[path]
+    ys = df["y_px"].values[path]
+
+    inner = []
+    for i in range(len(path) - 1):
+        dx = xs[i + 1] - xs[i]
+        dy_phys = -(ys[i + 1] - ys[i])        # 負號 = 影像座標翻成物理座標
+        inner.append(np.degrees(np.arctan2(dy_phys, dx)))
+
+    return np.array(inner)
+
+
+def add_boundary(inner_thetas, boundary_deg):
+    """
+    在顆粒對顆粒的角度序列頭尾各補上一個邊界角，得到完整序列
+        S = [ +boundary , theta_1 , ... , theta_(n-1) , -boundary ]
+    boundary_deg 設為 None 則直接回傳原序列（即完全不加邊界）。
+    """
+    if boundary_deg is None:
+        return np.asarray(inner_thetas, dtype=float)
+    return np.array([+boundary_deg] + list(inner_thetas) + [-boundary_deg], dtype=float)
+
+
+def evaluate_arch(thetas):
+    """
+    對一個 theta 序列套用兩條判定條件。
+
+    條件 A（局部容許條件）：theta_i + δθ > theta_(i+1)
+        → 移項得 δθ > theta_(i+1) - theta_i
+        → δθ_min = max_i ( theta_(i+1) - theta_i )，若全為負則取 0
+        【此移項為自行推導，非 Zhang 原文寫法，但與其掃描做法等價】
+
+    條件 B（全域凸起條件）：theta_i > theta_(i+2)，對所有可用的 i
+        → 完全不含 δθ，是一個「δθ 無關」的 pass/fail
+
+    參數：
+        thetas = 要檢驗的角度序列（可含邊界、也可不含，由呼叫端決定）
+
+    回傳 (dtheta_min, convex_pass, worst_index)
+        dtheta_min  = 這個序列被偵測到所需的最小 δθ
+        convex_pass = 條件 B 是否全數通過
+        worst_index = 決定 δθ_min 的那個相鄰差的索引，方便回去看是哪一段最差
+    """
+    thetas = np.asarray(thetas, dtype=float)
+
+    # 序列太短時（例如只有 2 顆顆粒又不加邊界），沒有相鄰差可算
+    if len(thetas) < 2:
+        return 0.0, True, -1
+
+    diffs = np.diff(thetas)                   # diffs[i] = theta_(i+1) - theta_i
+    worst_index = int(np.argmax(diffs))
+    dtheta_min = max(0.0, float(diffs.max()))
+
+    # 條件 B 需要至少 3 個角度才檢驗得了；不足時視為自動通過
+    convex_pass = bool(np.all(thetas[:-2] > thetas[2:])) if len(thetas) >= 3 else True
+
+    return dtheta_min, convex_pass, worst_index
+
+
+def evaluate_all_conventions(inner_thetas):
+    """
+    同一條拱，用三種「邊界口徑」各算一次，方便一次跑完就能比較。
+
+      main  = 含邊界，邊界角用 BOUNDARY_ANGLE_DEG      （目前定案的 30°）
+      alt   = 含邊界，邊界角用 BOUNDARY_ANGLE_ALT_DEG  （對照用的 60°）
+      inner = 完全不加邊界，只看顆粒對顆粒
+
+    回傳一個 dict，每個口徑都有 dtheta_min / convex_pass / worst_index，
+    另外附上 boundary_dominates：δθ_min 是不是由頭尾的邊界項決定的。
+    若為 True，代表這張照片的 δθ_min 其實沒在反映顆粒幾何，只在反映邊界設定。
+    """
+    out = {}
+    for key, b in (("main", BOUNDARY_ANGLE_DEG),
+                   ("alt", BOUNDARY_ANGLE_ALT_DEG),
+                   ("inner", None)):
+        s = add_boundary(inner_thetas, b)
+        d, c, w = evaluate_arch(s)
+        out[key] = {"thetas": s, "dtheta_min": d, "convex_pass": c, "worst_index": w}
+
+    # 含邊界的序列有 len(inner)+1 個相鄰差，索引 0 和最後一個就是頭尾的邊界項
+    n_diff_main = len(out["main"]["thetas"]) - 1
+    w = out["main"]["worst_index"]
+    out["boundary_dominates"] = bool(w == 0 or w == n_diff_main - 1)
+
+    return out
+
+
+# ============================================================================
+# 第 7 區：畫標註圖
+# ============================================================================
+
+def draw_annotation(img_roi, df, path, thetas, dtheta_min, convex_pass,
+                    out_path, title, wall_left=None, wall_right=None):
+    """
+    把偵測到的顆粒、選出的拱、每個 theta 值、以及兩條筒倉壁線畫在影像上，存成 PNG。
+    這一步非常重要：所有數字都可能看起來合理但其實抓錯顆粒，
+    只有把結果疊回原圖才看得出來。
+
+    wall_left / wall_right 是 ROI 內座標的兩點，畫成延伸的青色直線，
+    讓你確認程式認定的壁位置和你點的一致。
+    """
+    fig, ax = plt.subplots(figsize=(13, 10))
+    ax.imshow(cv2.cvtColor(img_roi, cv2.COLOR_BGR2RGB))
+
+    # 兩條筒倉壁線（延伸到畫面邊界，就是觸壁判定實際用的那條直線）
+    for w in (wall_left, wall_right):
+        if w is not None:
+            draw_extended_line(ax, w[0], w[1], color="cyan", lw=1.8, ls="--")
+
+    # 所有偵測到的顆粒畫成淡綠色小圈
+    ax.plot(df["x_px"], df["y_px"], "o", color="lime", markersize=4,
+            alpha=0.6, linestyle="none")
+
+    if path is not None:
+        px = df["x_px"].values[path]
+        py = df["y_px"].values[path]
+        # 拱的連線畫成紅色粗線，拱上的顆粒畫成紅點
+        ax.plot(px, py, "-o", color="red", linewidth=2.5, markersize=8)
+        # 在每段連線中點標上 theta 值（注意 thetas[0] 是邊界，所以位移 1）
+        for i in range(len(path) - 1):
+            mx, my = (px[i] + px[i + 1]) / 2, (py[i] + py[i + 1]) / 2
+            ax.text(mx, my, f"{thetas[i + 1]:.0f}", color="yellow", fontsize=9,
+                    ha="center", va="center",
+                    bbox=dict(boxstyle="round,pad=0.15", fc="black", alpha=0.6))
+
+    ax.set_title(title, fontsize=12)
+    ax.set_axis_off()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+
+
+# ============================================================================
+# 第 8 區：主流程
+# ============================================================================
+
+def main():
+    # --- 準備資料夾與快取 ---
+    os.makedirs(OUT_ANNOT_DIR, exist_ok=True)
+    cache = {}
+    if os.path.exists(CLICK_CACHE) and not REDO_CLICKS:
+        with open(CLICK_CACHE, "r", encoding="utf-8-sig") as f:
+            cache = json.load(f)
+
+    # --- 收集所有影像路徑 ---
+    paths = []
+    for ext in IMAGE_EXTS:
+        paths.extend(glob.glob(os.path.join(IMAGE_DIR, ext)))
+    paths = sorted(set(paths))
+
+    if not paths:
+        print(f"在 {IMAGE_DIR} 裡找不到任何影像。請確認資料夾名稱與檔案格式。")
+        return
+
+    print(f"找到 {len(paths)} 張影像\n")
+    results = []
+
+    # --- 逐張處理 ---
+    for k, p in enumerate(paths, 1):
+        name = os.path.basename(p)
+        print(f"[{k}/{len(paths)}] {name}")
+
+        img_full = cv2.imread(p)
+        if img_full is None:
+            print("   讀不到這張影像，跳過")
+            continue
+
+        # (1) 手點：ROI、螺絲、左右壁
+        clk = get_clicks_for_image(img_full, name, cache)
+
+        # (2) 由螺絲算比例尺，再推出顆粒直徑的像素值
+        s1, s2 = clk["screws"]
+        screw_px = np.hypot(s1[0] - s2[0], s1[1] - s2[1])
+        px_per_mm = screw_px / SCREW_DISTANCE_MM
+        diameter_px = PARTICLE_DIAMETER_MM * px_per_mm
+        print(f"   比例尺 {px_per_mm:.3f} px/mm，顆粒直徑 {diameter_px:.1f} px")
+
+        # (3) 裁切 ROI。注意之後所有座標都是 ROI 內座標，
+        #     壁線的點也要扣掉同樣的偏移才對得上。
+        x0, y0, x1, y1 = clk["roi"]
+        img_roi = img_full[y0:y1, x0:x1].copy()
+        off = np.array([x0, y0], dtype=float)
+        wall_left = [np.array(clk["wall_left"][0]) - off,
+                     np.array(clk["wall_left"][1]) - off]
+        wall_right = [np.array(clk["wall_right"][0]) - off,
+                      np.array(clk["wall_right"][1]) - off]
+
+        # (4) 偵測顆粒
+        df, markers = detect_particles(img_roi, diameter_px)
+        print(f"   偵測到 {len(df)} 顆顆粒")
+        if len(df) == 0:
+            results.append({"image": name, "status": "沒有偵測到顆粒"})
+            continue
+
+        # (5) 建接觸網路、找最下面的鏈
+        adjacency = build_contact_graph(df, markers, diameter_px)
+        path_idx, info = find_lowest_chain(df, adjacency, wall_left, wall_right,
+                                           diameter_px)
+
+        if path_idx is None:
+            print(f"   找不到拱：{info}")
+            draw_annotation(img_roi, df, None, None, None, None,
+                            os.path.join(OUT_ANNOT_DIR, f"{os.path.splitext(name)[0]}_annot.png"),
+                            T(f"{name}：找不到拱（{info}）", f"{name}: no arch found"),
+                            wall_left=wall_left, wall_right=wall_right)
+            results.append({"image": name, "status": info})
+            continue
+        if info:
+            print(f"   {info}")
+
+        # (6) 算 theta 序列，並用三種邊界口徑各判定一次
+        inner_thetas = compute_inner_thetas(df, path_idx)
+        ev = evaluate_all_conventions(inner_thetas)
+        n_particles = len(path_idx)
+
+        m, a, inn = ev["main"], ev["alt"], ev["inner"]
+        print(f"   拱顆粒數 n = {n_particles}")
+        print(f"     邊界 {BOUNDARY_ANGLE_DEG:.0f}°：δθ_min = {m['dtheta_min']:6.2f}°，"
+              f"凸起條件 {'通過' if m['convex_pass'] else '不通過'}")
+        print(f"     邊界 {BOUNDARY_ANGLE_ALT_DEG:.0f}°：δθ_min = {a['dtheta_min']:6.2f}°，"
+              f"凸起條件 {'通過' if a['convex_pass'] else '不通過'}")
+        print(f"     不含邊界 ：δθ_min = {inn['dtheta_min']:6.2f}°，"
+              f"凸起條件 {'通過' if inn['convex_pass'] else '不通過'}")
+        if ev["boundary_dominates"]:
+            print(f"     ⚠ 這張的 δθ_min 是由頭尾的邊界項決定的，不是顆粒幾何")
+
+        # (7) 存標註圖（標註圖上畫的是主要口徑的結果）
+        annot_path = os.path.join(OUT_ANNOT_DIR, f"{os.path.splitext(name)[0]}_annot.png")
+        draw_annotation(
+            img_roi, df, path_idx, m["thetas"], m["dtheta_min"], m["convex_pass"],
+            annot_path,
+            T(f"{name}   n={n_particles}   "
+              f"δθ_min(邊界{BOUNDARY_ANGLE_DEG:.0f}°)={m['dtheta_min']:.1f}°   "
+              f"δθ_min(不含邊界)={inn['dtheta_min']:.1f}°   "
+              f"凸起條件={'通過' if m['convex_pass'] else '不通過'}",
+              f"{name}  n={n_particles}  "
+              f"dtheta_min(bnd{BOUNDARY_ANGLE_DEG:.0f})={m['dtheta_min']:.1f}  "
+              f"dtheta_min(inner)={inn['dtheta_min']:.1f}  "
+              f"convex={'pass' if m['convex_pass'] else 'FAIL'}"),
+            wall_left=wall_left, wall_right=wall_right)
+
+        # (8) 記錄一列結果（三種口徑都記下來）
+        results.append({
+            "image": name,
+            "status": "ok" + ("" if not info else f" ({info})"),
+            "n_particles": n_particles,
+
+            # 主要口徑：含邊界，邊界角 = BOUNDARY_ANGLE_DEG
+            "dtheta_min_deg": round(m["dtheta_min"], 3),
+            "convex_pass": m["convex_pass"],
+            "worst_pair_index": m["worst_index"],       # 第幾個相鄰差決定了 δθ_min
+            "boundary_dominates": ev["boundary_dominates"],
+
+            # 對照口徑：含邊界，邊界角 = BOUNDARY_ANGLE_ALT_DEG
+            "dtheta_min_alt_deg": round(a["dtheta_min"], 3),
+            "convex_pass_alt": a["convex_pass"],
+
+            # 不含邊界：只看顆粒對顆粒
+            "dtheta_min_inner_deg": round(inn["dtheta_min"], 3),
+            "convex_pass_inner": inn["convex_pass"],
+
+            "px_per_mm": round(px_per_mm, 4),
+            # 只存顆粒對顆粒的角度，邊界角之後可以用任何值重新補上
+            "inner_thetas_deg": ";".join(f"{t:.3f}" for t in inner_thetas),
+        })
+
+    # --- 輸出每張照片的結果 ---
+    df_res = pd.DataFrame(results)
+    df_res.to_csv(OUT_RESULTS, index=False, encoding="utf-8-sig")
+    print(f"\n已輸出 {OUT_RESULTS}")
+
+    # --- 輸出累積曲線 ---
+    # 一個拱在給定 δθ 下被偵測到的條件是：δθ_min <= δθ 「且」全域凸起條件通過。
+    # 三種邊界口徑各畫一條曲線，放在同一個 CSV 的不同欄位。
+    ok = df_res[(df_res.get("status", "").astype(str).str.startswith("ok"))].copy()
+    if len(ok) > 0:
+        # 三種口徑的 (dtheta_min, convex_pass)
+        conventions = {
+            f"bnd{BOUNDARY_ANGLE_DEG:.0f}":     ("dtheta_min_deg",       "convex_pass"),
+            f"bnd{BOUNDARY_ANGLE_ALT_DEG:.0f}": ("dtheta_min_alt_deg",   "convex_pass_alt"),
+            "inner":                            ("dtheta_min_inner_deg", "convex_pass_inner"),
+        }
+
+        curve = {"dtheta_deg": DTHETA_SCAN}
+        for tag, (dcol, ccol) in conventions.items():
+            dmin = ok[dcol].astype(float).values
+            convex = ok[ccol].astype(bool).values
+            curve[f"n_detected_{tag}"] = [
+                int(np.sum((dmin <= d) & convex)) for d in DTHETA_SCAN
+            ]
+        curve["n_total_analysed"] = [len(ok)] * len(DTHETA_SCAN)
+        pd.DataFrame(curve).to_csv(OUT_CURVE, index=False, encoding="utf-8-sig")
+        print(f"已輸出 {OUT_CURVE}")
+
+        # --- 文字摘要 ---
+        print("\n" + "=" * 68)
+        print("摘要")
+        print("=" * 68)
+        print(f"成功分析的照片數：{len(ok)} / {len(df_res)}")
+
+        n_bdom = int(ok["boundary_dominates"].astype(bool).sum())
+        if n_bdom > 0:
+            print(f"\n⚠ 有 {n_bdom} / {len(ok)} 張的 δθ_min 是由頭尾的邊界項決定的。")
+            print(f"  這些張的 δθ_min 反映的是邊界角設定（目前 "
+                  f"{BOUNDARY_ANGLE_DEG:.0f}°），不是顆粒幾何。")
+            print(f"  請對照下面三種口徑的數字再決定邊界角要取多少。")
+
+        for tag, (dcol, ccol) in conventions.items():
+            dmin = ok[dcol].astype(float).values
+            convex = ok[ccol].astype(bool).values
+            label = {"inner": "不含邊界（只看顆粒對顆粒）"}.get(
+                tag, f"含邊界，邊界角 = {tag.replace('bnd', '')}°")
+
+            print(f"\n--- {label} ---")
+            n_fail = int((~convex).sum())
+            print(f"  通過全域凸起條件：{int(convex.sum())} / {len(ok)}")
+            if n_fail > 0:
+                print(f"    ⚠ 有 {n_fail} 張違反『theta_i > theta_(i+2)』。這個條件不含 δθ，")
+                print(f"      所以這些拱不論 δθ 開多大都不會被偵測到。")
+                print(f"      請先去標註圖確認是不是顆粒抓錯，不要直接當成物理結果。")
+
+            d_ok = dmin[convex]
+            if len(d_ok) > 0:
+                print(f"  δθ_min 統計（只算通過凸起條件的 {len(d_ok)} 張）：")
+                print(f"    最小 {d_ok.min():6.2f}°   中位數 {np.median(d_ok):6.2f}°   "
+                      f"最大 {d_ok.max():6.2f}°")
+                for d in (10, 20, 30, 40):
+                    print(f"    δθ = {d:2d}° → 偵測到 {int(np.sum(d_ok <= d)):2d} / {len(d_ok)} 個拱")
+
+        print("\n" + "=" * 68)
+        print("怎麼讀這三組數字")
+        print("=" * 68)
+        print("  『不含邊界』那一組是純粹的顆粒接觸幾何，不受邊界角設定影響，")
+        print("  是判斷『拱本身有多不理想』最乾淨的指標。")
+        print("  兩組含邊界的差距，就是邊界角設定帶進來的額外量。")
+        print("  若兩者差距遠大於『不含邊界』本身的大小，代表邊界項主導了結果。")
+
+    print("\n請務必打開 annot 資料夾逐張核對標註圖，確認紅線抓到的是你眼睛看到的那條拱。")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# ============================================================================
+# 疑難排解
+# ============================================================================
+# Q1. 跑起來圖沒有跳出來，或點擊沒反應
+#     → 在 VS Code 裡要用「Run Python File」執行這個 .py，不要用 Jupyter 互動視窗
+#       （互動視窗的圖是內嵌的，不能點）。
+#       如果還是不行，在檔案最上方 import matplotlib 之後加一行：
+#           matplotlib.use("TkAgg")
+#
+# Q2. 某一張點錯了想重點
+#     → 打開 clicks_cache.json，把那一張檔名的那一筆整個刪掉，再跑一次。
+#       要全部重點就把 REDO_CLICKS 改成 True。
+#
+# Q3. 標註圖顯示「找不到連接左右兩壁的路徑」
+#     → 通常是中間有一顆沒被偵測到，接觸網路斷了。先看淡綠色小圈有沒有漏。
+#       漏偵測 → 調 SEED_RATIO（0.45~0.70）或放寬 AREA_MIN_RATIO。
+#       偵測到但沒連起來 → 調大 CONTACT_DIST_RATIO（1.30 → 1.40）。
+#
+# Q4. 抓到的拱比眼睛看到的那條高
+#     → 可能是最低那條有顆粒漏偵測。同 Q3。
+#     → 若是分岔選錯邊，可以把 ENFORCE_X_MONOTONIC 改成 True 試試。
+#
+# Q5. δθ_min 算出來異常大（例如 >60°）
+#     → 幾乎都是抓錯顆粒。先看標註圖，不要先懷疑物理。
