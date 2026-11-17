@@ -1,0 +1,1676 @@
+# -*- coding: utf-8 -*-
+"""
+2.2track.py — 追蹤分析：掉落數、剩餘數、速度、堵塞機率
+==========================================================================
+直接按 VS Code 的 Run。不需要在終端機打任何指令。設定區在檔案最下面的「主程式」那一段
+（FOLDERS、VIDEOS、WORKERS、OVERLAY）。
+
+[2.2] 2026-11-17：本檔是 2_track.py 的複本（原檔沒有改動），偵測、追蹤、統計演算法完全相同，
+  只改了「一支影片出錯時的處理」（改動處標 [2.2]）：
+  原本寫 summary.txt / video_summary.json 這兩步不在錯誤處理範圍內，
+  例如 video_summary.json 已經存在（同時開了兩次程式）時，整批會跟著當掉、其他影片的進度全部白費。
+  現在任何一支影片出錯都只記到 logs/track_failures_<時間>.csv，其他影片照常跑完。
+  已存在的 video_summary.json 一律不覆寫。
+
+[v3] 2026-11-17 改版：流動／堵塞改用「筒倉內剩餘顆粒數 N(t) 的變化」判斷
+--------------------------------------------------------------------------
+為什麼改：舊版用「整顆越過出口線且往下掉」（穿線計數）判斷有沒有流出。
+  出口線以下的偵測範圍有限，高 α 的顆粒質心過出口時下半身已經超出範圍，
+  整顆偵測不到 → 流出沒被記到。高 α 每次只掉幾顆，整個小雪崩因此被抹掉，
+  相鄰事件被併在一起 → <s> 偏高、P_c 偏低。
+改了什麼（其餘偵測、追蹤、速度、朝向的演算法都沒動；改動處標 [v3]）：
+  1. 「筒倉內」的判定：質心在出口線以上 → 顆粒最高點 y_top 在出口線以上。
+     也就是「只要有一部分還在筒倉內，就算筒倉內」，卡在出口的那顆不會漏算。
+     它剛好是「整顆都在出口線下方」的補集，每顆顆粒每一刻只會被算在一邊。
+  2. 流動判定：不再看穿線，而是看 N(t)。先對 N(t) 做中位數平滑去掉閃爍，
+     平滑後的 N 比目前的平台值少 ≥ 1 顆就記為「這一幀有顆粒離開」。
+     連續 CLOG_FRAMES 幀都沒有顆粒離開 → 堵塞（判準和舊版相同，只是訊號換了）。
+  3. 只掉 1 顆的事件不算：堵塞前後存量差 < MIN_EVENT_DROP 的流動段視為雜訊，
+     併回前後的堵塞段（取代舊版的 MIN_EVENT_EXITS）。
+  4. 穿線計數（s_exit、rate_exit、P_c_exit…）全部移除。
+  5. 每支影片多輸出 count_trace.png（N(t) 與狀態），一眼就能檢查切分對不對。
+  6. 結果寫到 analysis_count/（新資料夾），不會因為舊結果的 video_summary.json 被跳過。
+
+本檔是 silo_auto/analyze_v2.py 的複本，和它的差別只有兩點：
+  (a) 主程式改成「按執行就跑」：標定檔讀 partical_autoTrack/labels/（1_label.py 產生的），
+      結果寫到 partical_autoTrack/analysis/<資料夾>/<影片>_out/。
+      已經跑完的影片（_out 裡有 video_summary.json）會跳過，
+      所以之後加新影片再按一次執行，只會跑新的。
+  (b) 出口線以下的偵測範圍固定用修正後的「長半軸 + b」（原本是 1.5·b），沒有切回舊設定的選項。
+      說明見 analyze_one 裡 below_mm 那一段的註解。
+
+以下是 analyze_v2.py 原本的說明（其中提到 --labels、--overlay 等指令參數的部分已不適用）
+--------------------------------------------------------------------------
+analyze_v2.py — 批次影像分析：掉落數、剩餘數、速度、堵塞機率
+本檔是 particle_formal_Capture.py（2_analyze.py）的複本。原檔沒有被改動。
+偵測、追蹤、流出判定、堵塞切分、P_c、流率的演算法與原檔完全相同；
+只改了下面五件「外圍」的事（每一處都標了 [v2]）：
+
+  1. 資料夾：原本 VIDEO_FOLDER 是單一字串；改成由對照表列出所有資料夾（或用 --folders 指定）。
+  2. 輸入輸出位置：.json 從自動標記的 run 資料夾讀（--labels），結果寫到新的
+     runs/<時間戳>_<雜湊>_analyze/，不寫進影片資料夾 → 不會覆寫既有的 *_out、all_*.csv。
+  3. 比例尺：原本把螺絲座標四捨五入後切模板，兩心間距被量化到整數像素；
+     改用 .json 裡的次像素比例尺 px_per_mm。螺絲模板照舊只用來補償相機晃動。
+     （加 --legacy-scale 可回到原本算法，用來驗證複本與原檔結果一致。）
+  4. 失敗處理：原本 except 後印一行就跳過；改成把失敗原因寫進 failures.csv。
+  5. 多支影片平行跑；每個資料夾只有第一支輸出 overlay.mp4（--overlay all/first/none）。
+
+另外在 all_summary.csv 多帶出 QC 欄位：螺絲互相關、間距標準差、表觀大小 k、半角、傾斜。
+
+用法（在 silo_auto 資料夾下）：
+    .venv\\Scripts\\python.exe analyze_v2.py --labels runs\\<label run>\\labels --workers 8
+
+以下為原檔說明 ------------------------------------------------------------
+程式掃描每個資料夾的 .json，逐支影片跑完整分析，全程不跳任何視窗。
+
+程式依功能分成六區：
+  [A] 標定讀取      讀 .json、比例尺、相機晃動補償、物理座標、筒倉遮罩
+  [B] 顆粒偵測      每一幀每顆顆粒的位置與朝向
+  [C] 追蹤與速度    顆粒 ID、軌跡、速度（只統計向下的）
+  [D] 筒倉內顆粒數與堵塞切分   [v3] N(t) 減少 → 有顆粒離開；連續 N 幀沒減少 → 堵塞
+  [E] 掉落數／剩餘數／P_c  堵塞前後的存量差
+  [F] 輸出          CSV、摘要、標註影片
+
+堵塞的定義（操作型判定，不是物理定律）
+  [v3] 連續 CLOG_FRAMES 幀內，筒倉內顆粒數 N（平滑後）都沒有減少
+  → 這一段判定為堵塞。預設 60 幀 @ 120 fps = 0.5 s。
+  （舊版是「沒有任何顆粒整顆落到出口線下方且具有向下速度」，已不使用。）
+  若該段期間筒倉內顆粒數已經少於 EMPTY_N，則判定為「流光(empty)」而不是堵塞。
+
+輸出（放在「影片檔名_out」資料夾）
+  frames.csv      每幀：偵測數、筒倉內顆粒數（原始／平滑／平台值）、這一幀離開幾顆、
+                  累計離開、狀態、事件編號
+  events.csv      每一次「兩次堵塞之間」的流出：掉落數、剩餘數、是否為第一筆／刪失、
+                  流率 rate_count（存量法），單位 顆/s
+  count_trace.png [v3] N(t) 與狀態的診斷圖
+  clogs.csv       每一段堵塞：起訖幀、持續時間、剩餘顆粒數
+  velocities.csv  流動期間所有「向下移動」的顆粒速度（每顆每幀一列）
+  orientations.csv 每顆每幀的長軸指向 tilt_deg（長軸與鉛直軸的夾角），不篩狀態
+  summary.txt     所有數字的摘要（請先看這個）
+  overlay.mp4     標註影片（可關）
+資料夾層級還會輸出 all_events.csv、all_summary.csv，把所有影片併在一起。
+
+座標：所有 *_mm 欄位都是物理座標，原點在出口中點、x 向右、y 向上，
+      並已用「兩面壁的對稱軸」校正相機傾斜。向下的速度 v_down 一律為正值。
+角度：theta_deg = 長軸與水平 +x 軸的夾角（0–180°）；
+      tilt_deg  = 長軸與鉛直軸的夾角（鉛直 = 0°、往右傾為正、範圍 [-90, +90)），
+      圓盤（α < 1.05）沒有長軸可定義，tilt_deg 一律為 NaN。
+特徵長度：一律取短軸全長 b = d_eq/√α（不是等效直徑 d_eq）。
+      速度門檻 V_MOVE_B_S、筒倉遮罩邊界、通道挑選的連通距離都以 b 為單位。
+"""
+
+import os
+import sys
+import json
+import time
+
+import _env
+_env.ensure(["cv2", "numpy", "pandas", "scipy", "matplotlib"])   # [v3] 多了 matplotlib（畫 N(t) 診斷圖）
+
+import cv2
+import numpy as np
+import pandas as pd
+from scipy.optimize import linear_sum_assignment
+from scipy.signal import savgol_filter
+from scipy.ndimage import maximum_filter
+
+# ==========================================================================
+# 設定區：平常只需要改這幾個
+# ==========================================================================
+# [v2] VIDEO_FOLDER 已移除：資料夾清單來自對照表 particle_lookup.csv（見 main）
+CLOG_FRAMES = 60         # 連續幾幀筒倉內顆粒數都沒有減少 → 判定為堵塞
+EMPTY_N = 3               # 筒倉內顆粒數少於這個值 → 視為流光，不算堵塞
+DROP_FIRST_EVENT = True  # 影片開始後第一筆流出要不要納入 P_c。
+                          # 不管設成什麼，events.csv 的 event_type 都會把第一筆標成
+                          # "first"，summary 也一定會同時給「只用 normal」和
+                          # 「含第一筆」兩種 P_c，所以這個開關只決定採用哪一個。
+MIN_EVENT_DROP = 2        # [v3] 一段流動前後的存量差至少要幾顆才算一次事件。
+                          # 只掉 1 顆的不算（併回前後的堵塞段），同時也擋掉
+                          # 「偵測閃爍讓 N 暫時少 1」造成的假事件。
+COUNT_SMOOTH_FRAMES = 15  # [v3] N(t) 的中位數平滑視窗（幀，取奇數，置中）。
+                          # 偵測偶爾漏抓一兩幀、或卡在出口的顆粒在出口線上下跳，
+                          # 都會讓 N 閃一下；比半個視窗（7 幀 ≈ 0.06 s）短的閃爍會被濾掉。
+                          # 置中的中位數不會讓「真的掉了一顆」的時間點延遲。
+COUNT_RISE_FRAMES = 30    # [v3] N 回升（例如漏抓的顆粒又被抓回來）要持續幾幀，
+                          # 平台值才跟著往上調。顆粒不會自己跑回筒倉，所以回升一定是
+                          # 偵測造成的；不讓平台值跟上的話，下一次真正的掉落會被忽略。
+MIN_TRACK_FRAMES = 15     # 軌跡壽命門檻：一條軌跡被追蹤到的總幀數少於這個值，
+                          # 就不計入「筒倉內顆粒數」。真顆粒在筒倉內會存在數百幀，
+                          # 背景亮斑造成的誤判通常只閃幾幀就消失。
+                          # 只影響計數，不影響流出判定（掉落中的顆粒軌跡本來就短）。
+WRITE_OVERLAY = True      # [v2] 只是預設值；實際由 --overlay 決定每支影片要不要輸出 overlay.mp4
+QUIET = False             # [v2] 平行跑時關掉逐 200 幀的進度列印
+OVERLAY_TRAIL = 10        # 追蹤軌跡尾巴畫幾幀（0 = 不畫）
+OVERLAY_SHOW_IDS = False  # 是否在每顆顆粒上標 ID（300 顆時會很擠，預設關）
+
+# ---------- 進階：通常不用動 ----------------------------------------------
+CHANNEL = "r"             # "auto" = 自動挑最穩的通道；也可指定 "r" / "lab_b" / "gray"
+                          # 橢圓顆粒固定用 "r"：auto 有時會挑到 lab_b，橢圓在 lab_b 下
+                          # 會漏抓 5–10%、靜止存量上下跳（IMG_0106 實測）。
+                          # 要恢復原本行為就改回 "auto"。
+WORK_B_PX = 20            # 偵測時把影像縮到短軸約幾 px（大 = 準但慢）
+SIZE_AUTO = True          # 自動量顆粒在畫面上的「表觀大小」，校正模板
+MF_MIN_RESPONSE = 0.15    # 匹配濾波響應下限。真顆粒中位約 0.67、第 5 百分位約 0.48；
+                          # 筒倉外亮背景造成的假顆粒約 0.40。調到 0.45 可以擋掉假的，
+                          # 代價是也會少抓約 4% 真的（先改善 ROI 與背景布比較好）
+MAX_OVERLAP = 0.20        # 兩顆模型橢圓最多重疊多少（比例）
+MIN_COVERAGE = 0.75       # 模型橢圓內至少要有多少比例是前景
+SEAM_K = 0.30             # 縫的深度超過 0.3 ×（前景−背景亮度差）就挖掉
+V_MOVE_B_S = 0.5          # 速度超過 0.5 b/s 才算「有在動」（流出判定用）。
+                          # 特徵長度已從等效直徑 d_eq 改為短軸全長 b = d_eq/√α，
+                          # 所以同一個係數 0.5 在 α 越大時代表越低的實際速度門檻
+                          # （α=1 → 5 mm/s、α=3.5 → 2.67 mm/s）。
+MEMORY_FRAMES = 3         # 顆粒暫時偵測不到時保留幾幀
+ROLL_CORRECT = True       # 用兩面壁的對稱軸校正相機傾斜
+MAX_FRAMES = None         # 每支只跑前 N 幀（測試用），None = 跑完 .json 指定的範圍
+BELOW_ORIG = False        # [v2] True = 出口線以下保留範圍用原檔的 1.5·b（見 analyze_one 內說明）
+SAVE_DETECTIONS = False   # True = 另外輸出每顆每幀的完整 detections.csv（檔案很大）
+
+ENC = dict(index=False, encoding="utf-8-sig", float_format="%.4f")
+
+
+# ==========================================================================
+# 共用小工具
+# ==========================================================================
+def read_frame(cap, i):
+    """跳到第 i 幀並讀出來（BGR）。"""
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+    ok, f = cap.read()
+    return f if ok else None
+
+
+def crop_stable(frame, roi, cam):
+    """一次做完「抵銷相機晃動」和「裁出 ROI」。
+    相機被碰到時整幀會平移 cam（px），這裡用一個仿射矩陣同時平移 −cam 並把
+    原點移到 ROI 左上角，輸出大小就是 ROI。比先 warp 整幀再裁快一倍以上，
+    而且支援次像素位移（直接 warp 整幀只是為了同一件事多算了 ROI 以外的像素）。"""
+    x0, y0, x1, y1 = roi
+    if np.hypot(*cam) < 0.3:
+        return frame[y0:y1, x0:x1]
+    M = np.float32([[1, 0, -x0 - cam[0]], [0, 1, -y0 - cam[1]]])
+    return cv2.warpAffine(frame, M, (x1 - x0, y1 - y0), borderMode=cv2.BORDER_REPLICATE)
+
+
+def angdiff180(a, b):
+    """兩個「180° 週期」角度的差，範圍 [-90, 90)。橢圓轉 180° 和原來一樣。"""
+    return (np.asarray(a) - np.asarray(b) + 90.0) % 180.0 - 90.0
+
+
+def parabolic(fm, f0, fp):
+    """三點拋物線內插，回傳峰值相對中間點的偏移（-0.5 ~ 0.5），用來做次像素定位。"""
+    den = fm - 2.0 * f0 + fp
+    return 0.0 if den >= -1e-12 else float(np.clip(0.5 * (fm - fp) / den, -0.5, 0.5))
+
+
+def half_extent(ra, rb, th_deg, nx, ny):
+    """橢圓的支撐函數：橢圓投影到方向 (nx, ny) 上的半寬。
+    h(n) = sqrt((ra·cosψ)² + (rb·sinψ)²)，ψ = 方向 n 與長軸的夾角。
+    這裡用來算「顆粒在鉛直方向上伸出質心多遠」，判斷整顆是否已經在出口線下方。"""
+    psi = np.arctan2(ny, nx) - np.radians(th_deg)
+    return np.hypot(ra * np.cos(psi), rb * np.sin(psi))
+
+
+def runs(mask):
+    """布林序列 → [(開始索引, 結束索引(含), 值)]。用來找連續的堵塞段／流動段。"""
+    out, s = [], 0
+    for i in range(1, len(mask) + 1):
+        if i == len(mask) or mask[i] != mask[s]:
+            out.append((s, i - 1, bool(mask[s])))
+            s = i
+    return out
+
+
+def fmt_dur(sec):
+    """[v3] 秒數 → 好讀的時間字串，例如 45s、12m30s、1h05m。"""
+    sec = max(0, int(round(sec)))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+
+
+def count_drops(N_s, rise_frames):
+    """[v3] 平滑後的筒倉內顆粒數 N_s → 每一幀「離開了幾顆」。
+    用一個「平台值」L 代表目前認定的筒倉內顆粒數，逐幀更新：
+      N_s < L：有顆粒離開 → 這一幀記 L − N_s 顆，L 降到 N_s。
+      N_s > L：顆粒不可能自己回到筒倉，所以這是偵測造成的（之前漏抓、現在又抓回來）。
+               連續 rise_frames 幀都比 L 多，才把 L 往上調到這段期間的最小值，
+               而且不記任何事件。不往上調的話，下一次真正的掉落會被吃掉。
+      N_s = L：沒事。
+    回傳 (每幀的平台值 L, 每幀離開的顆數)，兩者長度都和 N_s 一樣。"""
+    n = len(N_s)
+    L = np.zeros(n)                    # 每一幀的平台值
+    drop = np.zeros(n, int)            # 每一幀離開的顆數
+    lev = float(N_s[0]) if n else 0.0  # 目前的平台值
+    above = 0                          # N_s 已經連續幾幀比平台值多
+    for t in range(n):
+        x = float(N_s[t])
+        if x < lev:
+            drop[t] = int(round(lev - x))
+            lev, above = x, 0
+        elif x > lev:
+            above += 1
+            if above >= rise_frames:
+                lev, above = float(np.min(N_s[t - rise_frames + 1:t + 1])), 0
+        else:
+            above = 0
+        L[t] = lev
+    return L, drop
+
+
+# ==========================================================================
+# [A] 標定讀取
+# ==========================================================================
+SEARCH_PAD = 26           # 螺絲逐幀搜尋範圍：上一幀位置 ±(模板半寬 + 這個值) px
+
+
+def locate_screws(bgr, tpl, centers, half=32, pad=SEARCH_PAD):
+    """在 centers 附近用正規化互相關找回兩顆螺絲，回傳 [(x, y, 相關係數)]。
+    TM_CCOEFF_NORMED 會先扣掉平均亮度，所以對照明變化不敏感。
+    搜尋範圍只開 ±(half + pad)：相機是逐幀追蹤的，位移不會一次跳太多，
+    範圍開小一點可以省掉大部分的相關運算時間。"""
+    loc = []
+    for (cx, cy), t in zip(centers, tpl):
+        xi, yi = int(round(cx)), int(round(cy))
+        x0, y0 = max(0, xi - half - pad), max(0, yi - half - pad)
+        sub = bgr[y0:yi + half + pad, x0:xi + half + pad]
+        gray = sub if sub.ndim == 2 else cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY)
+        if gray.shape[0] < t.shape[0] or gray.shape[1] < t.shape[1]:
+            loc.append((cx, cy, 0.0))
+            continue
+        r = cv2.matchTemplate(gray, t, cv2.TM_CCOEFF_NORMED)
+        _, mv, _, (i, j) = cv2.minMaxLoc(r)
+        dx = parabolic(r[j, i - 1], r[j, i], r[j, i + 1]) if 0 < i < r.shape[1] - 1 else 0
+        dy = parabolic(r[j - 1, i], r[j, i], r[j + 1, i]) if 0 < j < r.shape[0] - 1 else 0
+        loc.append((x0 + i + dx + half, y0 + j + dy + half, mv))
+    return loc
+
+
+def screw_scale(cap, f0, f1, pts, screw_mm, half=32):
+    """兩顆螺絲 → px/mm，並回傳螺絲模板（之後逐幀追蹤相機晃動用）。
+    以點選位置切模板，在 25 個均勻取樣幀上重新定位，取兩心間距的中位數。
+    相機微震會讓兩顆一起動，相減就抵銷，所以間距比單顆位置穩定。"""
+    ref = cv2.cvtColor(read_frame(cap, f0), cv2.COLOR_BGR2GRAY)
+    H, W = ref.shape
+    tpl, ctr = [], []
+    for x, y in pts:
+        xi, yi = int(round(x)), int(round(y))
+        if not (half <= xi < W - half and half <= yi < H - half):
+            raise RuntimeError("螺絲太靠近畫面邊緣，切不出模板")
+        tpl.append(ref[yi - half:yi + half, xi - half:xi + half].copy())
+        ctr.append((xi, yi))
+    ref_pos = np.array([l[:2] for l in locate_screws(ref, tpl, ctr, half)])
+    dists, corr = [], []
+    for fi in np.linspace(f0, f1, 25).astype(int):
+        f = read_frame(cap, fi)
+        if f is None:
+            continue
+        loc = locate_screws(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), tpl, ctr, half)
+        if min(loc[0][2], loc[1][2]) > 0.6:
+            dists.append(np.hypot(loc[1][0] - loc[0][0], loc[1][1] - loc[0][1]))
+            corr.append(min(loc[0][2], loc[1][2]))
+    if len(dists) < 5:
+        raise RuntimeError("螺絲在多數幀都對不上模板，請重新標定螺絲十字中心")
+    d = np.array(dists)
+    return float(np.median(d)) / screw_mm, dict(
+        n=len(d), dist_px=float(np.median(d)), sd_px=float(d.std()),
+        corr=float(np.median(corr)), tpl=tpl, ctr=ctr, ref_pos=ref_pos)
+
+
+class Silo:
+    """四個標定點 → 壁線、出口、物理座標（含相機傾斜校正）、筒倉遮罩。
+    物理座標：原點 = 出口中點，x 向右，y 向上，單位 mm。"""
+
+    def __init__(self, pts, s):
+        self.LT, self.LB, self.RB, self.RT = [np.asarray(p, float) for p in pts]
+        self.s = s                                   # px/mm
+        self.o = (self.LB + self.RB) / 2.0           # 出口中點（影像座標）
+        self.D_mm = float(np.linalg.norm(self.RB - self.LB) / s)
+
+        def up(top, bot):   # 壁「由下往上」的單位向量，換成 y 向上的座標
+            v = np.array([top[0] - bot[0], bot[1] - top[1]])
+            return v / np.linalg.norm(v)
+        uL, uR = up(self.LT, self.LB), up(self.RT, self.RB)
+        bis = (uL + uR) / np.linalg.norm(uL + uR)    # 兩壁的對稱軸 = 真正的鉛直方向
+        self.roll = float(np.degrees(np.arctan2(-bis[0], bis[1]))) if ROLL_CORRECT else 0.0
+        c, sn = np.cos(np.radians(-self.roll)), np.sin(np.radians(-self.roll))
+        self.Rm = np.array([[c, -sn], [sn, c]])      # 把對稱軸轉成鉛直的旋轉矩陣
+        self.half_angles = [float(np.degrees(np.arccos(np.clip(u @ bis, -1, 1))))
+                            for u in (uL, uR)]       # 校正後兩壁與鉛直的夾角（設計值 30°）
+        self.n = {}                                  # 兩面壁的「向內」單位法向量
+        for side, (p, q) in (("left", (self.LT, self.LB)), ("right", (self.RT, self.RB))):
+            u = (q - p) / np.linalg.norm(q - p)
+            nv = np.array([-u[1], u[0]])
+            self.n[side] = (p, nv if (self.o - p) @ nv > 0 else -nv)
+
+    def to_phys(self, x, y):
+        """影像 px → 物理 mm。"""
+        q = np.stack([np.asarray(x, float) - self.o[0], self.o[1] - np.asarray(y, float)])
+        p = self.Rm @ q.reshape(2, -1) / self.s
+        return p[0], p[1]
+
+    def vec_phys(self, vx, vy):
+        """影像中的向量（px/幀）→ 物理向量（mm/幀）。y 向上為正。"""
+        p = self.Rm @ np.stack([np.asarray(vx, float), -np.asarray(vy, float)]).reshape(2, -1)
+        return p[0] / self.s, p[1] / self.s
+
+    def theta_phys(self, th_img):
+        """影像中的長軸角度（由 +x 往下為正）→ 物理角度（由 +x 逆時針為正）。"""
+        return (-np.asarray(th_img) - self.roll) % 180.0
+
+    def wall_dist(self, x, y, side):
+        """質心到壁線的垂直距離（px，向內為正）。"""
+        p, nv = self.n[side]
+        return (np.asarray(x, float) - p[0]) * nv[0] + (np.asarray(y, float) - p[1]) * nv[1]
+
+    def mask(self, x0, y0, x1, y1, margin_px, below_px):
+        """ROI 內的筒倉遮罩（uint8 0/1）：壁外一律排除；
+        出口線以下多留 below_px，讓正在掉出去的顆粒還追得到。"""
+        yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+        xp, yp = self.to_phys(xx.ravel(), yy.ravel())
+        xp, yp = xp.reshape(xx.shape), yp.reshape(xx.shape)
+        inside = ((self.wall_dist(xx, yy, "left") >= -margin_px) &
+                  (self.wall_dist(xx, yy, "right") >= -margin_px))
+        above = yp >= 0
+        below = (~above) & (yp >= -below_px / self.s) & \
+                (np.abs(xp) <= self.D_mm / 2 + margin_px / self.s)
+        return ((inside & above) | below).astype(np.uint8)
+
+
+def get_channel(bgr, which):
+    """取單一顏色通道。顆粒是淺棕色、背景是黑布，LAB 的 b 通道通常分得最開。"""
+    if which == "r":
+        return bgr[:, :, 2]
+    if which == "lab_b":
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 2]
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+
+def otsu_eta(vals):
+    """Otsu 的可分離度 η = 類間變異 / 總變異（0~1，越大代表前景背景分得越開）。"""
+    vals = vals.astype(np.float32)
+    if vals.size < 50:
+        return 0.0
+    t, _ = cv2.threshold(vals.astype(np.uint8).reshape(-1, 1), 0, 255,
+                         cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    lo, hi = vals[vals <= t], vals[vals > t]
+    if len(lo) < 10 or len(hi) < 10 or vals.var() < 1e-6:
+        return 0.0
+    w0, w1 = len(lo) / len(vals), len(hi) / len(vals)
+    return float(w0 * w1 * (lo.mean() - hi.mean()) ** 2 / vals.var())
+
+
+def off_pile_count(X, Y, link_px):
+    """回傳「沒有連到最大那一叢」的偵測數量。
+    物理依據：靜止料堆裡的顆粒一定互相接觸，整堆是連通的。筒倉外的亮背景、
+    壓克力上的倒影被誤判成顆粒時，會在料堆之外另外長出一小叢或散點，
+    和主料堆不連通。所以「沒連到主料堆的偵測數」就是誤判量的直接估計，
+    不需要人工標註答案。"""
+    n = len(X)
+    if n < 2:
+        return 0
+    d = np.hypot(X[:, None] - X[None, :], Y[:, None] - Y[None, :])
+    adj = d < link_px
+    lab = np.full(n, -1)
+    cur = 0
+    for i in range(n):                       # 簡單的廣度優先走訪，找連通分量
+        if lab[i] >= 0:
+            continue
+        stack, lab[i] = [i], cur
+        while stack:
+            j = stack.pop()
+            for k in np.nonzero(adj[j] & (lab < 0))[0]:
+                lab[k] = cur
+                stack.append(k)
+        cur += 1
+    return int(n - np.bincount(lab).max())
+
+
+def choose_channel(samples, mask_w, make_det, to_phys_xy, link_px):
+    """挑顏色通道。判準是「離群偵測率」最低，而不是 Otsu 可分離度最高。
+
+    為什麼不用 Otsu 可分離度：它衡量的是「前景和背景分得開不開」，而畫面裡
+    最強的對比是顆粒 vs 黑布，所以 R 通道分數最高。但 R 通道同時也把筒倉外
+    的淺色牆面、鋁架算成前景，於是在壁的邊緣長出一整排假顆粒。
+    LAB 的 b 通道量的是「黃-藍」，木片顆粒偏黃、牆面和金屬是中性色，
+    所以它才是真正能把顆粒和亮背景分開的通道。
+
+    直接用離群率當判準，就不必預設哪個通道比較好，換了照明或換了顆粒顏色
+    也會自動挑對。另外加一道保險：偵測數明顯比最佳者少的通道不納入考慮，
+    免得挑到一個「什麼都偵測不到所以離群率是 0」的通道。
+    """
+    stat = {}
+    for c in ("r", "lab_b", "gray"):
+        det = make_det(c)
+        det.set_floor(samples)
+        cnt, off = [], []
+        for w in samples:
+            D, _ = det.detect(w)
+            if len(D) == 0:
+                cnt.append(0)
+                continue
+            X, Y = to_phys_xy(D)
+            keep = Y >= 0                    # 只看筒倉內；出口下方掉落中的本來就離群
+            cnt.append(int(keep.sum()))
+            off.append(off_pile_count(D[keep, 0], D[keep, 1], link_px))
+        stat[c] = (float(np.median(cnt)),
+                   float(np.sum(off)) / max(1.0, float(np.sum(cnt))),
+                   float(np.min([otsu_eta(get_channel(f, c)[mask_w > 0]) for f in samples])))
+    # 保險門檻放在 0.85：誤判多的通道「偵測數」本來就被假顆粒灌水，
+    # 門檻訂太高反而會把乾淨的通道擋掉（實測 IMG_0002 就是這樣）。
+    # 排序先看離群率（取到 0.1 個百分點），離群率相同才比偵測數，
+    # 這樣既不會挑到幾乎偵測不到東西的通道，也不會被灌水的數字騙過去。
+    best_cnt = max(v[0] for v in stat.values())
+    ok = {c: v for c, v in stat.items() if v[0] >= 0.85 * best_cnt} or stat
+    pick = min(ok, key=lambda c: (round(ok[c][1], 3), -ok[c][0]))
+    return pick, stat
+
+
+# ==========================================================================
+# [B] 顆粒偵測
+# ==========================================================================
+class Detector:
+    """在「工作尺度」影像上偵測顆粒。工作尺度 = 把短軸縮到約 WORK_B_PX px，
+    這樣圓盤和細長橢圓都用同一套程式碼、同樣的相對解析度。"""
+
+    def __init__(self, ra_w, rb_w, mask_w, channel, alpha):
+        self.mask = mask_w
+        self.channel = channel
+        self.alpha = alpha
+        self.thr_hist = []
+        self.t_floor = 0.0        # 閾值下限，由 set_floor() 設定
+        self.delta_floor = 0.0
+        self.set_size(ra_w, rb_w)
+
+    def set_floor(self, samples_w):
+        """用「顆粒最多的那幾幀」訂一個閾值下限。
+        為什麼需要：顆粒全部流光之後畫面只剩黑背景，這時候 Otsu 會把背景的
+        雜訊硬切成兩類，閾值掉到很低，倒影和雜訊就會被當成前景，程式會在
+        空筒倉裡「偵測」出幾十顆不存在的顆粒。照明固定時顆粒的亮度是穩定的，
+        所以把閾值壓在「背景 + 0.35×(顆粒−背景)」之上，空畫面就不會有前景。"""
+        ts, deltas = [], []
+        for f in samples_w:
+            ch = cv2.GaussianBlur(get_channel(f, self.channel), (3, 3), 0)
+            vals = ch[self.mask > 0]
+            t, _ = cv2.threshold(vals.reshape(-1, 1), 0, 255,
+                                 cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            hi, lo = vals[vals > t], vals[vals <= t]
+            if len(hi) < 50 or len(lo) < 50:
+                continue
+            ts.append((float(lo.mean()), float(hi.mean())))
+            deltas.append(float(hi.mean() - lo.mean()))
+        if not ts:
+            return 0.0, 0.0
+        lo_ref = float(np.median([a for a, _ in ts]))
+        hi_ref = float(np.median([b for _, b in ts]))
+        self.t_floor = lo_ref + 0.35 * (hi_ref - lo_ref)
+        self.delta_floor = 0.5 * float(np.median(deltas))
+        return self.t_floor, hi_ref - lo_ref
+
+    def set_size(self, ra, rb):
+        """建立模板庫：內圈橢圓權重總和 +1、外環總和 −1（零均值）。
+        響應 = 內圈前景比例 − 外環前景比例：孤立顆粒 ≈1，兩顆中間的縫 ≈0。
+        α > 1 時每隔 step 度建一個朝向；step 隨 α 變細（長軸越長，角度越敏感）。"""
+        self.ra, self.rb = ra, rb
+        r = int(np.ceil(1.5 * rb))
+        self.kmin = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+        r = max(1, int(round(0.5 * rb)))
+        self.kseam = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+        self.disc = self.alpha < 1.05
+        self.step = 180.0 if self.disc else min(30.0, 45.0 / self.alpha)
+        self.angles = np.arange(0.0, 180.0, self.step)
+        beta = 1.0 + 2.5 / rb                     # 外環厚度約 2.5 px（看得到縫）
+        R = int(np.ceil(beta * ra)) + 1
+        yy, xx = np.mgrid[-R:R + 1, -R:R + 1].astype(np.float32)
+        self.R, self.K, self.inside = R, [], []
+        # 穿縫檢查的取樣點（以長軸為 u 軸）：長軸本身 + 兩條 ±0.35 短半軸的平行線，
+        # 長度縮在橢圓內 65% 處，避免取到顆粒邊緣（燒焦邊緣會讓表觀邊界內縮）
+        uv, line = [], []
+        for li, v0 in enumerate((0.0, 0.35, -0.35)):
+            L = 0.65 * ra * np.sqrt(1 - v0 ** 2)
+            u = np.arange(-L, L + 0.5, 1.0)
+            uv.append(np.stack([u, np.full_like(u, v0 * rb)]))
+            line.append(np.full(len(u), li))
+        self.axis_uv, self.axis_line = np.concatenate(uv, axis=1), np.concatenate(line)
+        for th in self.angles:
+            t = np.radians(th)
+            u = xx * np.cos(t) + yy * np.sin(t)       # 沿長軸
+            v = -xx * np.sin(t) + yy * np.cos(t)      # 沿短軸
+            ins = (u / ra) ** 2 + (v / rb) ** 2 <= 1
+            ring = ((u / (beta * ra)) ** 2 + (v / (beta * rb)) ** 2 <= 1) & ~ins
+            K = np.zeros_like(xx)
+            K[ins], K[ring] = 1.0 / ins.sum(), -1.0 / ring.sum()
+            self.K.append(K)
+            self.inside.append(ins)
+
+    def binarize(self, img_w, smooth=True):
+        """二值化 = 全域 Otsu 與「局部閾值」取較嚴的那個。
+        全域 Otsu 只用筒倉內像素算（9 幀中位數平滑），但它會被大片黑背景拉低；
+        當顆粒間的縫被倒影照亮時，縫也會超過 Otsu，相鄰顆粒就黏成一片。
+        局部閾值：每個顆粒像素離縫都不超過一個短半軸，所以 1.5 個短半軸內的
+        局部最小值 =「這附近的縫有多亮」。像素要比它亮 0.35×(前景−背景) 才算前景。"""
+        ch = cv2.GaussianBlur(get_channel(img_w, self.channel), (3, 3), 0)
+        vals = ch[self.mask > 0]
+        t, _ = cv2.threshold(vals.reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        hi, lo = vals[vals > t], vals[vals <= t]
+        delta = float(hi.mean() - lo.mean()) if len(hi) and len(lo) else 0.0
+        if smooth:
+            self.thr_hist = (self.thr_hist + [(t, delta)])[-9:]
+            t, delta = np.median(np.array(self.thr_hist), axis=0)
+        t = max(float(t), self.t_floor)          # 空畫面時 Otsu 會失控，壓住下限
+        delta = max(float(delta), self.delta_floor)
+        local = cv2.erode(ch, self.kmin).astype(np.float32) + 0.35 * delta
+        # 黑帽運算 = 閉運算 − 原圖，專抓「比短半軸窄的暗谷」= 緊貼的顆粒間的縫。
+        # 挖掉縫的前景只拿來算匹配濾波響應（讓峰值落在正確的顆粒上）；
+        # 覆蓋率檢查仍用原前景，否則顆粒表面的燒痕紋路會被當成縫而誤殺。
+        seam = cv2.morphologyEx(ch, cv2.MORPH_BLACKHAT, self.kseam) > SEAM_K * delta
+        fg = ((ch > np.maximum(t, local)) & (self.mask > 0)).astype(np.uint8)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        self.fg_seam = fg & ~seam
+        return fg, float(t)
+
+    def response(self, fg):
+        """每個朝向做一次相關，回傳 (各朝向響應堆疊, 最大響應, 最佳朝向索引)。"""
+        f = fg.astype(np.float32)
+        stack = np.stack([cv2.filter2D(f, cv2.CV_32F, K, borderType=cv2.BORDER_CONSTANT)
+                          for K in self.K])
+        return stack, stack.max(0), stack.argmax(0)
+
+    def detect(self, img_w):
+        """回傳 det = [(x, y, θ_影像, 響應), ...]（工作尺度座標）。"""
+        fg, thr = self.binarize(img_w)
+        stack, rmax, amax = self.response(self.fg_seam)
+        H, W = fg.shape
+        # 候選峰：局部極大 + 響應下限。最小間距只取 0.5 短半軸，因為細長顆粒
+        # 並排時中心距離只有一個短軸，不能用等效直徑當最小間距。
+        md = max(1, int(0.5 * self.rb))
+        pk = (rmax == maximum_filter(rmax, size=2 * md + 1)) & (rmax > MF_MIN_RESPONSE)
+        ys, xs = np.nonzero(pk)
+        order = np.argsort(-rmax[ys, xs])
+        occ = np.zeros((H, W), np.uint8)            # 已接受顆粒蓋掉的範圍
+        R, out = self.R, []
+        for y, x in zip(ys[order], xs[order]):
+            k = amax[y, x]
+            ins = self.inside[k]
+            ya, yb, xa, xb = max(0, y - R), min(H, y + R + 1), max(0, x - R), min(W, x + R + 1)
+            m = ins[ya - y + R:yb - y + R, xa - x + R:xb - x + R]
+            vis = m & (self.mask[ya:yb, xa:xb] > 0)
+            if vis.sum() < 0.4 * ins.sum():                       # 大半在 ROI／筒倉外
+                continue
+            if (occ[ya:yb, xa:xb][m] > 0).mean() > MAX_OVERLAP:   # 和已接受的重疊太多
+                continue
+            if fg[ya:yb, xa:xb][vis].mean() < MIN_COVERAGE:       # 橢圓內前景不夠
+                continue
+            dx = parabolic(rmax[y, x - 1], rmax[y, x], rmax[y, x + 1]) if 0 < x < W - 1 else 0
+            dy = parabolic(rmax[y - 1, x], rmax[y, x], rmax[y + 1, x]) if 0 < y < H - 1 else 0
+            th = 0.0
+            if not self.disc:
+                n = len(self.angles)
+                th = (self.angles[k] + self.step * parabolic(
+                    stack[(k - 1) % n, y, x], stack[k, y, x], stack[(k + 1) % n, y, x])) % 180
+            # 穿縫檢查：斜跨兩顆的假橢圓會被「橫貫的暗縫」同時切過三條取樣線；
+            # 顆粒表面的燒痕暗點只是局部，最多碰到一條。
+            c, sn = np.cos(np.radians(th)), np.sin(np.radians(th))
+            u, v = self.axis_uv
+            ax = np.rint(x + dx + u * c - v * sn).astype(int)
+            ay = np.rint(y + dy + u * sn + v * c).astype(int)
+            ok = (ax >= 0) & (ax < W) & (ay >= 0) & (ay < H)
+            ok[ok] = self.mask[ay[ok], ax[ok]] > 0
+            hit = np.zeros(3, bool)
+            hit[np.unique(self.axis_line[ok][fg[ay[ok], ax[ok]] == 0])] = True
+            if hit.all():
+                continue
+            occ[ya:yb, xa:xb][m] = 1
+            out.append((x + dx, y + dy, th, float(rmax[y, x])))
+        return np.array(out, float).reshape(-1, 4), thr
+
+
+def measure_size(det_obj, samples_w, ra0, rb0):
+    """表觀大小自動量測：模板縮放 k = 0.80~1.10，看哪個 k 讓峰值響應最高。
+    燒焦的深色邊緣會讓顆粒在二值圖上看起來比實際小一點，
+    判斷「整顆是否在出口線下方」要用畫面上看起來的大小才一致。"""
+    ks, sc = np.arange(0.80, 1.101, 0.05), []
+    fgs = [det_obj.binarize(f, smooth=False)[0] for f in samples_w]
+    for k in ks:
+        det_obj.set_size(ra0 * k, rb0 * k)
+        vals = []
+        for fg in fgs:
+            _, rmax, _ = det_obj.response(fg)
+            md = max(1, int(0.5 * det_obj.rb))
+            pk = (rmax == maximum_filter(rmax, size=2 * md + 1)) & (rmax > 0.3)
+            v = np.sort(rmax[pk])[::-1]
+            vals += list(v[:max(1, len(v) // 2)])    # 只取前一半（偵測得最清楚的）
+        sc.append(np.median(vals) if vals else 0)
+    i = int(np.argmax(sc))
+    k = ks[i] + (0.05 * parabolic(sc[i - 1], sc[i], sc[i + 1]) if 0 < i < len(ks) - 1 else 0)
+    det_obj.set_size(ra0 * k, rb0 * k)
+    return float(k)
+
+
+# ==========================================================================
+# [C] 追蹤
+# ==========================================================================
+class Tracker:
+    """等速度預測 + 匈牙利演算法做全域最佳指派。
+    b_px = 顆粒短軸長度（px），用來訂配對的距離門檻。"""
+
+    def __init__(self, b_px, alpha):
+        self.b = b_px
+        self.alpha = alpha
+        self.T = {}          # id → [x, y, vx, vy, θ(連續), 幾幀沒看到]
+        self.next = 0
+
+    def step(self, det):
+        ids = list(self.T)
+        out = np.full(len(det), -1, int)
+        if ids and len(det):
+            tr = np.array([self.T[i] for i in ids])
+            dt = tr[:, 5] + 1
+            pred = tr[:, :2] + tr[:, 2:4] * dt[:, None]       # 等速度外推
+            D = np.hypot(pred[:, None, 0] - det[None, :, 0],
+                         pred[:, None, 1] - det[None, :, 1])
+            # 門檻：一個短軸 + 半個預測位移。出口附近顆粒一幀可以掉 20–40 px，
+            # 門檻太小會在最關鍵的地方斷軌，所以基底用整個短軸而不是半個。
+            gate = 1.0 * self.b + 0.5 * np.hypot(tr[:, 2], tr[:, 3]) * dt
+            bad = D > gate[:, None]
+            if self.alpha >= 1.3:    # 一幀之內不可能轉超過 30°
+                bad |= np.abs(angdiff180(tr[:, None, 4], det[None, :, 2])) > 30
+            C = np.where(bad, 1e9, D)
+            for r, c in zip(*linear_sum_assignment(C)):
+                if C[r, c] >= 1e9:
+                    continue
+                t = self.T[ids[r]]
+                v = (det[c, :2] - np.array(t[:2])) / (t[5] + 1)
+                t[2:4] = list(0.3 * np.array(t[2:4]) + 0.7 * v)   # 速度做一點平滑
+                t[0], t[1] = det[c, 0], det[c, 1]
+                t[4] = t[4] + angdiff180(det[c, 2], t[4])         # 角度 unwrap
+                t[5] = -1
+                out[c] = ids[r]
+        for i in ids:
+            self.T[i][5] += 1
+            if self.T[i][5] > MEMORY_FRAMES:
+                del self.T[i]
+        for c in np.nonzero(out < 0)[0]:
+            self.T[self.next] = [det[c, 0], det[c, 1], 0.0, 0.0, det[c, 2], 0]
+            out[c] = self.next
+            self.next += 1
+        return out
+
+
+# ==========================================================================
+# 單支影片的完整分析
+# ==========================================================================
+def analyze_one(video_path, cfg, log, out_dir, do_overlay=False, legacy_scale=False,
+                progress=None):
+    """progress：[v3] 回報進度用的函式 progress(階段, 已完成幀數, 總幀數)，
+    平行跑的時候由主程式傳進來，不需要的話留 None。"""
+    def report(stage, done, total):
+        if progress is not None:
+            progress(stage, done, total)
+
+    # [v2] out_dir 由呼叫端指定（在 run 資料夾內）；已存在就失敗，不覆寫
+    os.makedirs(out_dir, exist_ok=False)
+
+    # ---------------- [A] 標定讀取 ----------------
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("打不開影片")
+    f0, f1 = cfg["start_frame"], cfg["end_frame"]
+    if MAX_FRAMES:
+        f1 = min(f1, f0 + MAX_FRAMES - 1)
+    # [v3] 進度條用的總幀數：.json 的 end_frame 可能比影片實際長度還多（剪過的片段），
+    #      所以和影片的幀數取小的。這個數字只拿來算進度百分比，不影響分析範圍。
+    n_vid = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    n_est = max(1, (min(f1, n_vid - 1) if n_vid > 0 else f1) - f0 + 1)
+    report("準備中", 0, n_est)
+    fps = float(cfg["true_fps"])
+    alpha = float(cfg["alpha"])
+    d_eq = float(cfg["d_eq_mm"])
+    n_init = int(cfg["n_initial"])
+    n_use = f1 - f0 + 1
+    ref = read_frame(cap, f0)
+    log(f"影片 {cfg['video']}：{ref.shape[1]}×{ref.shape[0]}，分析第 {f0}–{f1} 幀"
+        f"（{n_use} 幀 @ {fps:.1f} fps = {n_use / fps:.1f} s）")
+    log(f"    α = {alpha}、d_eq = {d_eq} mm、初始顆粒數 = {n_init}")
+
+    s_tpl, sinfo = screw_scale(cap, f0, f1, np.array(cfg["screws"], float), cfg["screw_distance_mm"])
+    # [v2] 比例尺來源。screw_scale 的模板以「四捨五入後的座標」為中心，兩心間距因此被量化到
+    #      整數像素；它只適合當相機晃動的追蹤器。次像素比例尺由自動標記寫在 .json 的 px_per_mm。
+    if legacy_scale:
+        s = s_tpl
+        log(f"[A] 比例尺 {s:.4f} px/mm（--legacy-scale：原檔的模板間距算法；螺絲間距 "
+            f"{sinfo['dist_px']:.2f} px，{sinfo['n']} 幀標準差 {sinfo['sd_px']:.2f} px，"
+            f"互相關 {sinfo['corr']:.2f}）")
+    else:
+        # [v3] 新版 1_label.py 只寫 px_per_mm_preview，沒有 px_per_mm → 兩個都接受
+        s_key = "px_per_mm" if "px_per_mm" in cfg else "px_per_mm_preview"
+        if s_key not in cfg:
+            raise RuntimeError(".json 裡沒有 px_per_mm / px_per_mm_preview（不是自動標記產生的標定檔）")
+        s = float(cfg[s_key])
+        log(f"[A] 比例尺 {s:.4f} px/mm（.json 的次像素螺絲間距）；模板追蹤間距換算 "
+            f"{s_tpl:.4f} px/mm（差 {s_tpl / s - 1:+.2%}，{sinfo['n']} 幀標準差 "
+            f"{sinfo['sd_px']:.2f} px，互相關 {sinfo['corr']:.2f}）")
+    silo = Silo(cfg["silo"], s)
+    x0, y0, x1, y1 = cfg["roi"]
+    log(f"    出口寬 {silo.D_mm:.1f} mm；相機傾斜 {silo.roll:+.2f}°；"
+        f"兩壁半角 {silo.half_angles[0]:.1f}° / {silo.half_angles[1]:.1f}°（設計 30°）")
+    log(f"    ROI x {x0}–{x1}、y {y0}–{y1}")
+
+    b_mm, a_mm = d_eq / np.sqrt(alpha), d_eq * np.sqrt(alpha)
+    ra0, rb0 = a_mm / 2 * s, b_mm / 2 * s                  # 設計半軸（全圖 px）
+    sc = min(1.0, WORK_B_PX / (2 * rb0))                   # 工作尺度縮放倍率
+    Ww, Hw = int(round((x1 - x0) * sc)), int(round((y1 - y0) * sc))
+    # 遮罩的邊界寬容量也改以短軸全長 b 為特徵長度（原本是等效直徑 d_eq）。
+    # ⚠ below_px 是「出口線以下還保留多少範圍」，而流出判定要求整顆都在出口線下方
+    #   （最高點 y_top < 0），顆粒質心最多要再往下走一個長半軸 ra = a/2。
+    #   1.5·b 在 α 大時會小於 ra（α=3.5：1.5·b = 8.0 mm、ra = 9.35 mm），
+    #   長軸接近鉛直的顆粒可能在離開遮罩前都還沒被判定為流出。
+    #   若 summary 的流出數明顯偏低，把 1.5 調大（或改用 a_mm）即可。
+    # [v2] 出口線以下保留的範圍。原檔固定 1.5·b，並在上面的註解警告：α 大時 1.5·b 會小於
+    #      長半軸 ra，長軸接近鉛直的顆粒在離開遮罩前都不會被判定為流出，「若流出數明顯偏低，
+    #      把 1.5 調大（或改用 a_mm）」。α = 3 實測穿線計數只有存量法的 18%，小雪崩因為
+    #      「流出不到 2 顆」被當成雜訊抹掉、相鄰事件被併在一起。
+    #      改成 ra + 1.0·b（= 長半軸再多留一個短軸）。α = 1 時 ra = 0.5·b，剛好等於原本的 1.5·b，
+    #      所以圓盤的結果不受影響；所有 α 用同一條公式。--below-orig 可回到原本的 1.5·b。
+    below_mm = 1.5 * b_mm if BELOW_ORIG else 0.5 * a_mm + 1.0 * b_mm
+    log(f"    出口線以下保留 {below_mm:.2f} mm（{'原檔 1.5·b' if BELOW_ORIG else 'ra + b'}）")
+    mask_full = silo.mask(x0, y0, x1, y1, margin_px=0.2 * b_mm * s, below_px=below_mm * s)
+    mask_w = cv2.resize(mask_full, (Ww, Hw), interpolation=cv2.INTER_NEAREST)
+
+    def to_work(crop):
+        """已經裁好的 ROI 影像 → 工作尺度影像。"""
+        return cv2.resize(crop, (Ww, Hw), interpolation=cv2.INTER_AREA)
+
+    roi_box = (x0, y0, x1, y1)
+    samples = [to_work(f[y0:y1, x0:x1]) for f in (read_frame(cap, i) for i in
+               np.linspace(f0, f1, 40).astype(int)) if f is not None]
+    def _to_phys(D):
+        """工作尺度的偵測座標 → 物理 mm（通道挑選時判斷是否在筒倉內要用）。"""
+        return silo.to_phys(x0 + (D[:, 0] + 0.5) / sc - 0.5,
+                            y0 + (D[:, 1] + 0.5) / sc - 0.5)
+
+    if CHANNEL == "auto":
+        sub = samples[::max(1, len(samples) // 12)]       # 抽 12 幀就夠，省時間
+        channel, st = choose_channel(
+            sub, mask_w, lambda c: Detector(ra0 * sc, rb0 * sc, mask_w, c, alpha),
+            # 連通判定距離，換算成工作尺度 px。特徵長度改為短軸全長 b。
+            # ⚠ 兩顆長軸對接的橢圓，質心距離可達長軸 a = α·b，遠大於 1.45·b，
+            #   會被判定為「沒連到主料堆」而把離群率灌水。CHANNEL 固定 "r" 時
+            #   不會走到這裡；若改回 "auto" 請把 1.45 放大或改用 a_mm。
+            _to_phys, 1.45 * b_mm * s * sc)
+        log("    通道自動選擇：" + channel)
+        for c, (n_, off, eta) in st.items():
+            log(f"      {c:<6} 偵測中位 {n_:5.0f}   離群率 {off:6.2%}   可分離度 {eta:.3f}"
+                + ("   <-- 採用" if c == channel else ""))
+    else:
+        channel = CHANNEL
+    detector = Detector(ra0 * sc, rb0 * sc, mask_w, channel, alpha)
+    fill = [d_[0].sum() for d_ in (detector.binarize(f, smooth=False) for f in samples)]
+    full_idx = np.argsort(fill)[-8:]                     # 顆粒最多的 8 幀
+    t_floor, contrast = detector.set_floor([samples[i] for i in full_idx])
+    log(f"    閾值下限 {t_floor:.1f}（顆粒與背景亮度差 {contrast:.1f}）")
+    k_size = 1.0
+    if SIZE_AUTO:
+        k_size = measure_size(detector, [samples[i] for i in full_idx], ra0 * sc, rb0 * sc)
+        log(f"    表觀大小 = 設計值 × {k_size:.3f}" +
+            ("   ⚠ 偏離超過 8%：請檢查螺絲是否點準、d_eq/α 是否正確"
+             if abs(k_size - 1) > 0.08 else ""))
+    ra, rb = ra0 * k_size, rb0 * k_size                    # 表觀半軸（全圖 px）
+    ra_mm, rb_mm = ra / s, rb / s
+    log(f"    顆粒：長軸 {2 * ra:.1f} px、短軸 {2 * rb:.1f} px；工作尺度 ×{sc:.3f}")
+
+    # ---------------- [B][C] 逐幀偵測與追蹤 ----------------
+    def to_full(det):
+        f = det.copy()
+        f[:, 0] = x0 + (det[:, 0] + 0.5) / sc - 0.5
+        f[:, 1] = y0 + (det[:, 1] + 0.5) / sc - 0.5
+        return f
+
+    tracker = Tracker(2 * rb, alpha)
+    rows, fstats = [], []
+    cap.set(cv2.CAP_PROP_POS_FRAMES, f0)
+    t0 = time.time()
+    cam = np.zeros(2)                                      # 相機相對參考幀的位移（px）
+    screw_pos = sinfo["ref_pos"].copy()
+    for fi in range(f0, f1 + 1):
+        ok, frame = cap.read()
+        if not ok:
+            f1 = fi - 1
+            break
+        # 影像穩定：逐幀找螺絲，相機被碰到時把畫面平移回參考幀的位置。
+        # 螺絲被手遮住（相關係數低）時沿用上一幀的位移。
+        loc = locate_screws(frame, sinfo["tpl"], screw_pos)
+        if min(loc[0][2], loc[1][2]) > 0.6:
+            screw_pos = np.array([l[:2] for l in loc])
+            cam = (screw_pos - sinfo["ref_pos"]).mean(0)
+        det, thr = detector.detect(to_work(crop_stable(frame, roi_box, cam)))
+        dfull = to_full(det)
+        ids = tracker.step(dfull[:, :3])
+        for i in range(len(det)):
+            rows.append((fi, ids[i], dfull[i, 0], dfull[i, 1], dfull[i, 2]))
+        fstats.append((fi, len(det), thr, cam[0], cam[1]))
+        done = fi - f0 + 1
+        if done % 20 == 0:                                 # [v3] 每 20 幀回報一次進度
+            report("偵測追蹤", done, n_est)
+        if (fi - f0) % 200 == 0 and not QUIET:
+            el = time.time() - t0
+            # [v3] 多印百分比和預估剩餘時間
+            print(f"    幀 {fi - f0}/{n_est}（{done / n_est:.0%}）：{len(det)} 顆，"
+                  f"{el / done * 1000:.0f} ms/幀，預估還要 {fmt_dur(el / done * (n_est - done))}")
+    cap.release()
+    n_use = f1 - f0 + 1
+    report("分析與輸出", n_est, n_est)                    # [v3]
+    log(f"[B][C] 偵測+追蹤完成：{time.time() - t0:.0f} s")
+
+    df = pd.DataFrame(rows, columns=["frame", "id", "x_px", "y_px", "theta_img"])
+    if df.empty:
+        raise RuntimeError("整支影片都沒有偵測到顆粒，請檢查 ROI 與筒倉四點")
+    df = df.sort_values(["id", "frame"]).reset_index(drop=True)
+
+    # 速度：對每條軌跡的 x(t)、y(t) 做 Savitzky-Golay 微分（視窗 ≈ 0.05 s）。
+    # 比兩幀相減穩定得多，因為偵測的次像素誤差會被多點擬合平均掉。
+    win = max(5, int(round(0.05 * fps)) | 1)
+    vx, vy = np.zeros(len(df)), np.zeros(len(df))
+    for _, idx in df.groupby("id").indices.items():
+        for col, v in (("x_px", vx), ("y_px", vy)):
+            y = df[col].to_numpy()[idx]
+            if len(y) >= win:
+                v[idx] = savgol_filter(y, win, 2, deriv=1)
+            elif len(y) >= 2:
+                v[idx] = np.gradient(y)
+    df["t_sec"] = (df["frame"] - f0) / fps
+    df["x_mm"], df["y_mm"] = silo.to_phys(df["x_px"], df["y_px"])
+    vxm, vym = silo.vec_phys(vx, vy)
+    df["vx_mm_s"], df["vy_mm_s"] = vxm * fps, vym * fps     # y 向上為正
+    df["speed_mm_s"] = np.hypot(df["vx_mm_s"], df["vy_mm_s"])
+    df["v_down_mm_s"] = -df["vy_mm_s"]                      # 向下為正
+    df["theta_deg"] = 0.0 if alpha < 1.05 else silo.theta_phys(df["theta_img"])
+    # 長軸指向：長軸與鉛直軸的夾角。鉛直 = 0°、長軸上端往右傾為正、往左傾為負，
+    # 範圍 [-90°, +90°)。theta_deg 量的是長軸與水平 +x 軸的夾角（0–180°），
+    # 兩者差 90°，再用 angdiff180 折回 180° 週期的主區間
+    # （橢圓轉 180° 和原來一樣，所以水平會落在 −90°，與 +90° 等價）。
+    # 只要統計「偏離鉛直多少」而不分左右傾，取 tilt_deg.abs() 即可。
+    # 圓盤（α < 1.05）沒有可定義的長軸，一律填 NaN；
+    # 不填 0 是為了避免被當成「長軸鉛直」混進角度統計裡。
+    df["tilt_deg"] = (np.nan if alpha < 1.05
+                      else angdiff180(90.0, df["theta_deg"].to_numpy()))
+
+    # ---------------- [D] 筒倉內顆粒數 N(t) 與堵塞切分 ----------------
+    # 顆粒在鉛直方向上伸出質心多遠（mm）。圓盤就是半徑；橢圓要看朝向。
+    h_up = half_extent(ra_mm, rb_mm, df["theta_deg"].to_numpy(), 0.0, 1.0)
+    df["y_top_mm"] = df["y_mm"] + h_up                      # 顆粒最高點
+    v_move = V_MOVE_B_S * b_mm                              # 「有在動」的速度下限（以短軸 b 為準，速度統計用）
+    # [v3] 筒倉內 = 顆粒最高點在出口線以上（只要有一部分還在筒倉內，就算筒倉內），
+    #      而且這條軌跡活得夠久。舊版用「質心在出口線以上」，卡在出口、質心已經
+    #      低於出口線的那顆會被漏算。
+    # 加壽命門檻的理由：壓克力上的倒影、筒倉外的亮背景會被當成顆粒，而且常常
+    # 閃一下就消失，每閃一次就是一條新的短軌跡。真顆粒一旦在筒倉內，會被連續
+    # 追蹤數百幀，不可能只出現十幾幀。
+    df["track_len"] = df.groupby("id")["frame"].transform("size")
+    df["long_track"] = df["track_len"] >= MIN_TRACK_FRAMES
+    df["in_silo_raw"] = df["y_top_mm"] >= 0                 # 未過濾壽命，保留下來供比對
+    df["in_silo"] = df["in_silo_raw"] & df["long_track"]
+
+    idx = pd.RangeIndex(f0, f1 + 1, name="frame")
+    fr = pd.DataFrame(fstats, columns=["frame", "n_detected", "threshold",
+                                       "cam_dx_px", "cam_dy_px"]).set_index("frame")
+    fr = fr.reindex(idx)
+    fr["n_detected"] = df.groupby("frame").size().reindex(idx).fillna(0).astype(int)
+    fr["n_in_silo"] = df[df["in_silo"]].groupby("frame").size().reindex(idx).fillna(0).astype(int)
+    fr["n_in_silo_raw"] = (df[df["in_silo_raw"]].groupby("frame").size()
+                           .reindex(idx).fillna(0).astype(int))
+    fr["n_short_track"] = fr["n_in_silo_raw"] - fr["n_in_silo"]   # 被壽命門檻濾掉幾顆
+    fr = fr.reset_index()
+    fr["t_sec"] = (fr["frame"] - f0) / fps
+
+    # [v3] N(t) → 每一幀離開了幾顆。
+    #   第 1 步：置中的滾動中位數，濾掉短暫的偵測閃爍（例如漏抓一兩幀）。
+    #   第 2 步：平台值追蹤（count_drops）：平滑後的 N 比平台值少 → 有顆粒離開。
+    N_smooth = (fr["n_in_silo"].rolling(COUNT_SMOOTH_FRAMES | 1, center=True, min_periods=1)
+                .median().to_numpy())
+    N_smooth = np.floor(N_smooth + 0.5)          # 視窗在影片頭尾變偶數長時中位數會是 .5，取整
+    level, n_drop = count_drops(N_smooth, COUNT_RISE_FRAMES)
+    fr["n_in_silo_smooth"] = N_smooth.astype(int)
+    fr["n_level"] = level.astype(int)
+
+    # 堵塞切分：連續 CLOG_FRAMES 幀都沒有顆粒離開 → 這一段是「沒有東西掉下來」。
+    # 其中若筒倉內顆粒數已少於 EMPTY_N，代表是流光了，不是堵塞。
+    killed_runs = []                             # 被抹掉的小流動段 (a, b)，見下面的迴圈
+
+    def segment(drops):
+        """把逐幀的離開顆數切成「堵塞段」與「流動段」。
+        每段靜止期記下開頭存量 n_start 與結尾存量 n_end：
+          一般的靜止期：兩個都是整段的中位數（和舊版一樣）。
+          中間併過「只掉 1 顆」小流動段的靜止期：在小流動段處切開，
+            n_start = 第一小段的中位數、n_end = 最後一小段的中位數。
+        事件的掉落數 = 前一段靜止期的 n_end − 後一段靜止期的 n_start。"""
+        quiet = drops == 0
+        st = np.array(["flow"] * len(fr), dtype=object)
+        cg = []
+        nis = fr["n_in_silo"]
+        for a, b, v in runs(quiet):
+            if not v or (b - a + 1) < CLOG_FRAMES:
+                continue
+            n_med = float(nis.iloc[a:b + 1].median())
+            kind = "empty" if n_med < EMPTY_N else "clog"
+            st[a:b + 1] = kind
+            # 這段靜止期裡面被併掉的小流動段，把靜止期切成幾小段
+            inner = sorted((ka, kb) for ka, kb in killed_runs if a <= ka and kb <= b)
+            pieces, p0 = [], a
+            for ka, kb in inner:
+                if ka > p0:
+                    pieces.append((p0, ka - 1))
+                p0 = kb + 1
+            if p0 <= b:
+                pieces.append((p0, b))
+            if inner and pieces:
+                n_start = float(nis.iloc[pieces[0][0]:pieces[0][1] + 1].median())
+                n_end = float(nis.iloc[pieces[-1][0]:pieces[-1][1] + 1].median())
+            else:
+                n_start = n_end = n_med
+            cg.append(dict(kind=kind, a=a, b=b, n_in_silo=n_med, n_start=n_start, n_end=n_end))
+        return st, cg
+
+    n_head = min(CLOG_FRAMES, len(fr))           # 影片開頭／結尾拿來量存量的幀數
+
+    def plateaus(a, b, cg):
+        """流動段 [a, b] 前後的存量 (N_before, N_after, 前一段靜止期, 後一段靜止期)。
+        前面沒有靜止期 → 用影片開頭幾幀；後面沒有 → 用這段流動最後幾幀。"""
+        prev = [c for c in cg if c["b"] < a]
+        nxt = [c for c in cg if c["a"] > b]
+        prev = prev[-1] if prev else None
+        nxt = nxt[0] if nxt else None
+        nis = fr["n_in_silo"]
+        nb = prev["n_end"] if prev else float(nis.iloc[:n_head].median())
+        na = nxt["n_start"] if nxt else float(nis.iloc[max(0, b - n_head):b + 1].median())
+        return nb, na, prev, nxt
+
+    # 存量差 < MIN_EVENT_DROP 的流動段視為雜訊或「只掉 1 顆」，抹掉後重切，
+    # 直到沒有這種段為止。被抹掉的段會和前後的堵塞段併成一段長堵塞。
+    # （只掉的那 1 顆不會被算進前後任何一個事件：前一個事件用的是
+    #   這段長堵塞「第一小段」的存量，後一個事件用的是「最後一小段」的存量。）
+    state, clogs = segment(n_drop)
+    killed = 0
+    while True:
+        bad = [(a, b) for a, b, v in runs(state == "flow")
+               if v and (lambda p: p[0] - p[1])(plateaus(a, b, clogs)) < MIN_EVENT_DROP]
+        if not bad:
+            break
+        for a, b in bad:
+            n_drop[a:b + 1] = 0
+        killed_runs.extend(bad)
+        killed += len(bad)
+        state, clogs = segment(n_drop)
+    # 起點修正：堵塞剛要破的時候，顆粒開始晃動，偵測偶爾漏抓一顆，N 會先閃一下
+    # 「少 1 顆」又回來，流動段的起點因此被提前（實測 IMG_0109 提前了 27 幀）。
+    # 掉落數不受影響（用的是前後靜止期的存量），但持續時間和流率會被拉長。
+    # 做法：在流動段裡找「平滑後的 N 最後一次還等於流動前存量」的那一幀，
+    # 真正的流動從它的下一幀開始，前面那幾幀併回前一段堵塞。
+    for a, b, v in runs(state == "flow"):
+        if not v:
+            continue
+        nb, _, prev, _ = plateaus(a, b, clogs)
+        if prev is None:                         # 影片一開始就在流動：沒有可以併回去的堵塞段
+            continue
+        back = np.nonzero(N_smooth[a:b + 1] >= nb)[0]
+        if len(back) and back[-1] < b:
+            t = a + int(back[-1])
+            state[a:t + 1] = prev["kind"]
+            n_drop[a:t + 1] = 0                  # 那一下閃爍不算離開
+            prev["b"] = t
+    fr["n_drop"] = n_drop
+    fr["n_drop_cum"] = fr["n_drop"].cumsum()   # 只供參考；掉落數 s 以存量差為準
+    fr["state"] = state
+
+    # ---------------- [E] 掉落數／剩餘數／P_c ----------------
+    # 事件 = 兩段「沒有東西掉」之間的流動期。
+    # 掉落數 s_count = 前一段靜止期結尾的筒倉內顆粒數 − 後一段靜止期開頭的顆粒數
+    # （用中位數，靜止期數得最準）。[v3] 穿線計數 s_exit 已移除。
+    clog_only = [c for c in clogs if c["kind"] == "clog"]
+    events = []
+    for a, b, v in runs((fr["state"] == "flow").to_numpy()):
+        if not v:
+            continue
+        # [v3] 前後存量統一由 plateaus() 給（和上面抹掉小事件時用的是同一套算法）。
+        #      第一筆前面沒有堵塞 → 用影片開頭幾幀；影片在流動中結束 → 用最後幾幀。
+        N_before, N_after, prev, nxt = plateaus(a, b, clogs)
+        events.append(dict(
+            event_id=len(events),
+            start_frame=int(fr["frame"].iloc[a]), end_frame=int(fr["frame"].iloc[b]),
+            duration_s=(b - a + 1) / fps,
+            s_count=N_before - N_after,                      # 存量差
+            N_before=N_before, N_after=N_after,
+            is_first_flow=len(events) == 0,                  # 這支影片的第一筆流出
+            preceded_by_clog=prev is not None,               # 前面有被堵塞夾住
+            # 最後一次流出：後面沒有堵塞，而是流光或影片結束 → 真值其實是 s ≥ 觀測值
+            is_last_censored=(nxt is None) or (nxt["kind"] == "empty"),
+        ))
+    ev = pd.DataFrame(events, columns=["event_id", "start_frame", "end_frame", "duration_s",
+                                       "s_count", "N_before", "N_after",
+                                       "is_first_flow", "preceded_by_clog", "is_last_censored"])
+    # 第一筆的「前一次堵塞」發生在開拍前，所以它的 N_before 是從影片開頭量的，
+    # 不是從錄到的堵塞期量的。這一欄把這件事記下來，之後看數據才知道差別。
+    ev["N_before_from_video_start"] = ev["is_first_flow"] & (~ev["preceded_by_clog"])
+    # 流率（顆/s）= 掉落數 ÷ 這次流動的持續時間。
+    #   rate_count：用存量差 s_count。整支影片的總數守恆，漏算最少。
+    # 注意：單筆事件常常只有零點幾秒，逐筆流率的誤差很大；
+    #       要和 Beverloo 比，請用 summary 裡的「合併流率」或「回歸斜率」。
+    ev["rate_count"] = ev["s_count"] / ev["duration_s"]
+    # 「可用」= 兩端都被堵塞夾住、而且掉落數為正。
+    # 最後一筆是刪失資料（流光了，堵塞沒發生），納入會低估 <s>，所以一律排除。
+    # 影片開始後的第一筆流出則另外處理：它仍然符合 s 的定義
+    #   （s = 一次破拱到再次堵塞之間流出的顆粒數），
+    # 只是它前面那次堵塞是開拍前形成的，過程沒有錄到，所以單獨標成 "first"。
+    ev["is_valid"] = (ev["preceded_by_clog"] & (~ev["is_last_censored"])
+                      & (ev["s_count"] > 0))
+
+    def label(r):
+        """每一筆事件歸成一類，方便在 CSV 裡直接篩。"""
+        if r["is_last_censored"]:
+            return "last_censored"       # 最後一次流出：流光了，真值是 s ≥ 觀測值
+        if not r["is_valid"]:
+            return "excluded"            # 前面沒有堵塞，或掉落數 ≤ 0
+        return "first" if r["is_first_flow"] else "normal"
+
+    ev["event_type"] = ev.apply(label, axis=1) if len(ev) else pd.Series(dtype=object)
+    ev["used_for_Pc"] = ev["is_valid"] & (~(DROP_FIRST_EVENT & ev["is_first_flow"]))
+
+    def pc(sub, col):
+        m = sub[col].mean() if len(sub) else np.nan
+        return float(1.0 / m) if len(sub) and m > 0 else np.nan
+
+    # 三個集合都算，這樣「第一筆要不要算」不必在跑程式前就決定
+    norm = ev[ev["event_type"] == "normal"]
+    first = ev[ev["event_type"] == "first"]
+    both = ev[ev["event_type"].isin(["first", "normal"])]
+    P_c_normal, P_c_both = pc(norm, "s_count"), pc(both, "s_count")
+    use = ev[ev["used_for_Pc"]]
+    P_c = pc(use, "s_count")
+    ev["P_c"] = P_c
+    s_first = float(first["s_count"].iloc[0]) if len(first) else np.nan
+
+    # 整支影片的流率。流率不受「最後一筆是刪失」影響（顆粒照樣在流），
+    # 所以這裡用全部事件，不套 P_c 的篩選。
+    #   合併流率 = 總掉落數 ÷ 總流動時間（短事件的雜訊會互相抵消）
+    #   回歸斜率 = s 對持續時間做直線擬合的斜率（扣掉每次起流的暫態，最接近穩態流率）
+    T_flow = float(ev["duration_s"].sum()) if len(ev) else 0.0
+    Q_count = float(ev["s_count"].sum() / T_flow) if T_flow > 0 else np.nan
+    Q_mean = float(ev["rate_count"].mean()) if len(ev) else np.nan
+    Q_sem = float(ev["rate_count"].std() / np.sqrt(len(ev))) if len(ev) > 1 else np.nan
+    if len(ev) >= 3 and ev["duration_s"].nunique() > 1:
+        Q_slope, Q_icpt = (float(v) for v in np.polyfit(ev["duration_s"], ev["s_count"], 1))
+    else:
+        Q_slope, Q_icpt = np.nan, np.nan
+
+    # 「最早開始的堵塞」= 第一段被判定為 clog 的靜止期，另外標出來
+    first_clog_id = next((i for i, c in enumerate(clogs) if c["kind"] == "clog"), None)
+    cl = pd.DataFrame([dict(clog_id=i, kind=c["kind"],
+                            start_frame=int(fr["frame"].iloc[c["a"]]),
+                            end_frame=int(fr["frame"].iloc[c["b"]]),
+                            duration_s=(c["b"] - c["a"] + 1) / fps,
+                            n_remaining=c["n_in_silo"],
+                            is_first_clog=(i == first_clog_id))
+                      for i, c in enumerate(clogs)],
+                     columns=["clog_id", "kind", "start_frame", "end_frame",
+                              "duration_s", "n_remaining", "is_first_clog"])
+
+    # 把事件編號貼回逐幀表
+    eid = np.full(len(fr), -1)
+    for e in events:
+        m = (fr["frame"] >= e["start_frame"]) & (fr["frame"] <= e["end_frame"])
+        eid[m.to_numpy()] = e["event_id"]
+    fr["event_id"] = eid
+
+    # ---------------- [C 續] 速度統計 ----------------
+    # 只取「流動期間、ROI 內、往下移動」的顆粒；靜止期的速度是量測雜訊，
+    # 混進來會在 v ≈ 0 疊出一根假的尖峰，所以不納入。
+    df = df.merge(fr[["frame", "state", "event_id"]], on="frame", how="left")
+    vel = df[(df["state"] == "flow") & (df["v_down_mm_s"] > 0)][
+        ["frame", "t_sec", "id", "x_mm", "y_mm", "v_down_mm_s", "event_id"]].copy()
+    # moving 旗標：速度低於 V_MOVE_B_S × b（預設 0.5 b/s）的多半是靜止顆粒的量測雜訊，
+    # 這裡不先刪掉（刪了 P(v) 的低速端就被切掉），只標起來讓你之後自己決定。
+    vel["moving"] = vel["v_down_mm_s"] > v_move
+    # y_mm 保留著：之後若要對齊 Zhang 的「出口上方 4·d_eq」，直接篩 y_mm <= 4*d_eq 即可
+
+    # ---------------- [F] 輸出 ----------------
+    fr.to_csv(os.path.join(out_dir, "frames.csv"), **ENC)
+    ev_cols = ["event_id", "event_type", "start_frame", "end_frame", "duration_s",
+               "s_count", "rate_count",
+               "N_before", "N_after", "used_for_Pc", "P_c",
+               "is_first_flow", "preceded_by_clog", "is_last_censored", "is_valid",
+               "N_before_from_video_start"]
+    ev[[c for c in ev_cols if c in ev.columns]].to_csv(
+        os.path.join(out_dir, "events.csv"), **ENC)
+    cl.to_csv(os.path.join(out_dir, "clogs.csv"), **ENC)
+    vel.to_csv(os.path.join(out_dir, "velocities.csv"), **ENC)
+    # 長軸指向：每顆每幀一列，不受 state 篩選（靜止期、堵塞期、出口下方的顆粒都收）。
+    # state / event_id / in_silo / long_track 一起帶出來，之後要只看流動期、
+    # 只看筒倉內、或只看長軌跡，都可以直接在這張表上篩，不必回頭改程式。
+    ori = df[["frame", "t_sec", "id", "x_mm", "y_mm",
+              "theta_deg", "tilt_deg", "in_silo", "long_track",
+              "state", "event_id"]].copy()
+    ori.to_csv(os.path.join(out_dir, "orientations.csv"), **ENC)
+    if SAVE_DETECTIONS:
+        df.to_csv(os.path.join(out_dir, "detections.csv"), **ENC)
+    plot_count_trace(fr, ev, fps, os.path.join(out_dir, "count_trace.png"),
+                     f"{cfg['video']}  α={alpha}")                # [v3] N(t) 診斷圖
+
+    cm = np.hypot(fr["cam_dx_px"], fr["cam_dy_px"])
+    log(f"[A] 相機晃動（已補償）：最大 {cm.max() / s:.2f} mm")
+    nd = fr["n_detected"]
+    log(f"[B] 每幀偵測數：中位 {nd.median():.0f}、最少 {nd.min()}、最多 {nd.max()}"
+        f"（初始設定 {n_init} 顆）")
+    tl = df.groupby("id")["frame"].size()
+    log(f"[C] 軌跡壽命門檻 {MIN_TRACK_FRAMES} 幀："
+        f"{int((tl < MIN_TRACK_FRAMES).sum())}/{len(tl)} 條軌跡不計入筒倉內顆粒數；"
+        f"每幀平均濾掉 {fr['n_short_track'].mean():.2f} 顆")
+    vm = vel[vel["moving"]]
+    log(f"[C] 流動期間向下移動的顆粒速度：{len(vel)} 筆（其中 moving={len(vm)} 筆）")
+    if len(vm):
+        q = vm["v_down_mm_s"].quantile([0.25, 0.5, 0.75])
+        log(f"    moving 的中位 {q[0.5]:.1f} mm/s、四分位 {q[0.25]:.1f}–{q[0.75]:.1f}、"
+            f"最大 {vm['v_down_mm_s'].max():.1f} mm/s")
+    log(f"[D] 狀態分佈：流動 {(fr['state'] == 'flow').sum()} 幀、"
+        f"堵塞 {(fr['state'] == 'clog').sum()} 幀、流光 {(fr['state'] == 'empty').sum()} 幀；"
+        f"堵塞 {len(clog_only)} 次")
+    log(f"    [v3] 以 N(t) 判斷：平滑視窗 {COUNT_SMOOTH_FRAMES} 幀；"
+        f"存量差 < {MIN_EVENT_DROP} 顆而被併回堵塞的流動段 {killed} 段")
+    name = {"first": "第一筆（前一次堵塞在開拍前）", "normal": "",
+            "last_censored": "最後一次流出（刪失，真值 s ≥ 觀測值）",
+            "excluded": "不納入"}
+    log(f"[E] 事件 {len(ev)} 筆：first {len(first)}、normal {len(norm)}、"
+        f"last_censored {int((ev['event_type'] == 'last_censored').sum())}、"
+        f"excluded {int((ev['event_type'] == 'excluded').sum())}")
+    for _, e in ev.iterrows():
+        tag = name[e.event_type]
+        log(f"    事件 {int(e.event_id)} [{e.event_type:>13}]："
+            f"幀 {int(e.start_frame)}–{int(e.end_frame)}（{e.duration_s:.2f} s） "
+            f"掉落 {e.s_count:.0f} 顆 剩餘 {e.N_after:.0f} 顆 "
+            f"流率 {e.rate_count:.0f} 顆/s"
+            + (f"  ← {tag}" if tag else ""))
+    if np.isfinite(s_first):
+        log(f"    第一筆的 s = {s_first:.0f} 顆")
+    # 兩種算法都給：第一筆要不要算進去，留給分析階段決定
+    if np.isfinite(P_c_normal):
+        log(f"    只用 normal（{len(norm)} 筆）：<s> = {norm['s_count'].mean():.1f}，"
+            f"P_c = {P_c_normal:.4f}，相對標準誤 ≈ {1 / np.sqrt(len(norm)):.0%}")
+    if np.isfinite(P_c_both):
+        log(f"    含第一筆（{len(both)} 筆）：<s> = {both['s_count'].mean():.1f}，"
+            f"P_c = {P_c_both:.4f}，相對標準誤 ≈ {1 / np.sqrt(len(both)):.0%}")
+    if np.isfinite(P_c):
+        log(f"    目前 DROP_FIRST_EVENT = {DROP_FIRST_EVENT} → 採用 P_c = {P_c:.4f}"
+            f"（{len(use)} 筆）")
+    else:
+        log("    沒有可用的 堵塞→流動→堵塞 事件，無法計算 P_c")
+    if np.isfinite(Q_count):
+        log(f"[E] 流率（全部 {len(ev)} 筆事件，流動共 {T_flow:.2f} s）")
+        log(f"    合併流率（總掉落數 ÷ 總流動時間）：{Q_count:.1f} 顆/s")
+        if np.isfinite(Q_sem):
+            log(f"    逐筆平均：存量法 {Q_mean:.1f} ± {Q_sem:.1f} 顆/s"
+                f"（事件很短時這個數字不穩，僅供參考）")
+        if np.isfinite(Q_slope):
+            log(f"    s 對持續時間的回歸斜率：{Q_slope:.1f} 顆/s（截距 {Q_icpt:.1f} 顆）")
+
+    if do_overlay:                                           # [v2] 由呼叫端決定
+        report("輸出追蹤影片", n_est, n_est)                  # [v3]
+        t_ov = time.time()
+        write_overlay(video_path, os.path.join(out_dir, "overlay.mp4"), df, fr, ev, silo,
+                      (x0, y0, x1, y1), ra, rb, f0, f1, fps, alpha, v_move)
+        log(f"[F] 追蹤影片 overlay.mp4 完成：{time.time() - t_ov:.0f} s")
+
+    summary = dict(video=cfg["video"], alpha=alpha, d_eq_mm=d_eq, n_initial=n_init,
+                   fps=fps, start_frame=f0, end_frame=f1, px_per_mm=s,
+                   outlet_width_mm=silo.D_mm, n_clogs=len(clog_only), n_events=len(ev),
+                   n_events_for_Pc=int(ev["used_for_Pc"].sum()),
+                   mean_s_count=float(use["s_count"].mean()) if len(use) else np.nan,
+                   P_c=P_c,
+                   # 第一筆單獨列出，以及「不含／含第一筆」兩種 P_c
+                   s_first=s_first, n_normal=len(norm),
+                   mean_s_normal=float(norm["s_count"].mean()) if len(norm) else np.nan,
+                   P_c_normal_only=P_c_normal,
+                   n_with_first=len(both), P_c_with_first=P_c_both,
+                   total_s_count=float(ev["s_count"].sum()),
+                   # 流率（顆/s）：合併、逐筆平均、回歸斜率；穿線法只當對照
+                   total_flow_time_s=T_flow,
+                   flow_rate_count=Q_count,
+                   flow_rate_count_event_mean=Q_mean, flow_rate_count_event_sem=Q_sem,
+                   flow_rate_count_slope=Q_slope, flow_rate_count_intercept=Q_icpt,
+                   channel=channel,
+                   n_detected_median=float(fr["n_detected"].median()),
+                   first_clog_frame=int(cl.loc[cl["is_first_clog"], "start_frame"].iloc[0])
+                   if bool(cl["is_first_clog"].any()) else -1,
+                   last_event_s_count=float(ev.loc[ev["is_last_censored"], "s_count"].iloc[-1])
+                   if bool(ev["is_last_censored"].any()) else np.nan,
+                   median_v_down_mm_s=float(vm["v_down_mm_s"].median()) if len(vm) else np.nan,
+                   # [v2] QC 欄位（原本只印在 summary.txt 裡）
+                   b_mm=float(b_mm), px_per_mm_template=float(s_tpl),
+                   screw_corr=float(sinfo["corr"]), screw_sd_px=float(sinfo["sd_px"]),
+                   screw_n=int(sinfo["n"]), k_size=float(k_size),
+                   half_angle_deg=float(np.mean(silo.half_angles)), roll_deg=float(silo.roll),
+                   cam_shake_max_mm=float(cm.max() / s), n_detected_max=int(nd.max()),
+                   N_first=float(fr["n_in_silo"].iloc[:n_head].median()),
+                   n_empty_frames=int((fr["state"] == "empty").sum()),
+                   end_class_label=cfg.get("end_class", ""),
+                   legacy_scale=bool(legacy_scale))
+    return out_dir, ev.assign(video=cfg["video"]), summary
+
+
+# ==========================================================================
+# [v3] N(t) 診斷圖
+# ==========================================================================
+def plot_count_trace(fr, ev, fps, path, title):
+    """畫出筒倉內顆粒數 N(t) 與狀態，用來一眼檢查堵塞切分有沒有對。
+      灰色細線  每幀的原始 N（計入筒倉內的顆數）
+      黑色粗線  平滑後的 N（流動判定用的就是這條）
+      底色      橘 = 流動、綠 = 堵塞、灰 = 流光
+      每段流動上方的數字是該事件的掉落數 s（括號內是分類的縮寫）"""
+    import matplotlib
+    matplotlib.use("Agg")                     # 不開視窗，直接存檔
+    import matplotlib.pyplot as plt
+    # 中文字型：依序試微軟正黑體（Windows）、Noto（Linux），都沒有就用預設字型
+    plt.rcParams["font.sans-serif"] = ["Microsoft JhengHei", "Noto Sans CJK TC",
+                                       "Noto Sans CJK JP", "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+    t = fr["t_sec"].to_numpy()
+    fig, ax = plt.subplots(figsize=(14, 4.5))
+    colors = {"flow": "#f5b26b", "clog": "#9fd8a4", "empty": "#cccccc"}
+    st = fr["state"].to_numpy()
+    s0 = 0
+    for i in range(1, len(st) + 1):           # 逐段塗底色
+        if i == len(st) or st[i] != st[s0]:
+            ax.axvspan(t[s0], t[i - 1] + 1.0 / fps, color=colors.get(st[s0], "white"),
+                       alpha=0.5, lw=0)
+            s0 = i
+    ax.plot(t, fr["n_in_silo"], color="0.6", lw=0.6, label="N 原始")
+    ax.plot(t, fr["n_in_silo_smooth"], color="k", lw=1.4, label="N 平滑後")
+    short = {"normal": "n", "first": "f", "last_censored": "c", "excluded": "x"}
+    ytop = float(fr["n_in_silo"].max())
+    for _, e in ev.iterrows():
+        tm = ((e.start_frame + e.end_frame) / 2 - fr["frame"].iloc[0]) / fps
+        ax.text(tm, ytop + 1, f"{e.s_count:.0f}({short.get(e.event_type, '?')})",
+                ha="center", va="bottom", fontsize=8)
+    ax.set_xlabel("t (s)")
+    ax.set_ylabel("筒倉內顆粒數 N")
+    ax.set_title(title + "   底色：橘=流動  綠=堵塞  灰=流光；數字 = 掉落數 s"
+                 "（n=normal f=first c=刪失 x=不納入）", fontsize=9)
+    ax.set_ylim(top=ytop + 6)
+    ax.legend(loc="lower left", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+# ==========================================================================
+# 標註影片
+# ==========================================================================
+def write_overlay(video, path, df, fr, ev, silo, roi, ra, rb, f0, f1, fps, alpha, v_move):
+    """追蹤過程影片。畫面上的東西：
+      綠線      筒倉壁與出口線（出口線 y = 0）
+      黃橢圓    [v3] 計入「筒倉內」的顆粒（最高點在出口線以上、軌跡夠長），中心小點是質心
+      洋紅橢圓  [v3] 不計入的顆粒：整顆都已經在出口線下方
+      橘色尾巴  正在移動的顆粒最近 OVERLAY_TRAIL 幀走過的路徑，用來看追蹤有沒有斷
+      上方兩行文字
+        第一行：幀號、時間、狀態、這一幀偵測到幾顆、筒倉內幾顆（原始 / 平滑後）、
+                累計離開幾顆
+        第二行：目前在第幾個事件；上一次掉落事件的顆粒數 s 與它的分類
+    """
+    x0, y0, x1, y1 = roi
+    k = min(1.0, 1000.0 / (y1 - y0))
+    size = (int((x1 - x0) * k), int((y1 - y0) * k))
+    # 寫檔的幀率要取整數：mp4v 的時間基底分母上限是 65535，直接丟 119.917
+    # 這種小數進去會算出 1000/119917 而開不了編碼器。這只影響播放速度標示，
+    # 不影響任何分析數值（分析一律用 .json 裡的 true_fps）。
+    vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), round(fps), size)
+    if not vw.isOpened():
+        print("    ⚠ 開不了影片編碼器，略過 overlay.mp4")
+        return
+    # 被軌跡壽命門檻濾掉的顆粒不畫出來，畫面上看到的黃色就是真正被計入的。
+    # 整顆已經在出口線下方的顆粒不套用這個過濾（它們本來就不計入，畫成洋紅色
+    # 方便確認「部分在筒倉內」的判定有沒有對）。
+    show = df[df["long_track"] | (~df["in_silo_raw"])]
+    by_f = {f: g for f, g in show.groupby("frame")}
+    st = fr.set_index("frame")
+
+    # 「上一次掉落的顆粒數」：對每一幀查出最後一個已經結束的事件，
+    # 把它的 s_count 和分類先算好，播放時直接查表。
+    prev_txt = {}
+    done = []
+    for fi in range(f0, f1 + 1):
+        while len(done) < len(ev) and int(ev["end_frame"].iloc[len(done)]) < fi:
+            done.append(len(done))
+        if done:
+            e = ev.iloc[done[-1]]
+            prev_txt[fi] = (f"last drop: s={e.s_count:.0f}  [{e.event_type}]  "
+                            f"event {int(e.event_id)}")
+        else:
+            prev_txt[fi] = "last drop: --"
+
+    cap = cv2.VideoCapture(video)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, f0)
+    S = 16                                              # cv2 次像素繪圖：座標 ×16
+    trail = {}                                          # id → 最近幾幀的質心座標
+
+    def P(x, y):
+        return (int(round((x - x0) * k * S)), int(round((y - y0) * k * S)))
+
+    def Q(x, y):                                        # 整數像素座標（畫文字、點用）
+        return (int(round((x - x0) * k)), int(round((y - y0) * k)))
+
+    for fi in range(f0, f1 + 1):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        cam = ((st.loc[fi, "cam_dx_px"], st.loc[fi, "cam_dy_px"])
+               if fi in st.index else (0.0, 0.0))
+        img = cv2.resize(crop_stable(frame, (x0, y0, x1, y1), np.array(cam, float)), size)
+        for a, b in ((silo.LT, silo.LB), (silo.LB, silo.RB), (silo.RB, silo.RT)):
+            cv2.line(img, P(*a), P(*b), (0, 255, 0), 1, cv2.LINE_AA, 4)
+
+        g = by_f.get(fi)
+        alive = set()
+        if g is not None:
+            for r in g.itertuples():
+                alive.add(r.id)
+                col_p = (0, 220, 220) if r.in_silo else (255, 0, 255)   # 黃 = 計入、洋紅 = 不計入
+                th = 0.0 if alpha < 1.05 else r.theta_img
+                # 輪廓
+                cv2.ellipse(img, P(r.x_px, r.y_px), (int(ra * k * S), int(rb * k * S)),
+                            th, 0, 360, col_p, 1, cv2.LINE_AA, 4)
+                # 質心
+                cv2.circle(img, P(r.x_px, r.y_px), int(1.5 * S), (255, 255, 255),
+                           -1, cv2.LINE_AA, 4)
+                # 軌跡尾巴：只有在動的才畫，不然靜止的料堆會糊成一片
+                if OVERLAY_TRAIL > 0:
+                    h = trail.setdefault(r.id, [])
+                    h.append((r.x_px, r.y_px))
+                    del h[:-OVERLAY_TRAIL]
+                    if r.v_down_mm_s > v_move and len(h) > 1:
+                        cv2.polylines(img, [np.array([Q(*p) for p in h], np.int32)],
+                                      False, (0, 140, 255), 1, cv2.LINE_AA)
+                if OVERLAY_SHOW_IDS:
+                    px, py = Q(r.x_px, r.y_px)
+                    cv2.putText(img, str(int(r.id)), (px - 8, py - 4), 0, 0.32,
+                                (255, 255, 255), 1, cv2.LINE_AA)
+        for i in list(trail):                            # 消失的軌跡不要一直留著
+            if i not in alive:
+                del trail[i]
+
+        if fi in st.index:
+            s_ = st.loc[fi]
+            col = {"flow": (0, 200, 255), "clog": (200, 255, 200),
+                   "empty": (160, 160, 160)}[s_.state]
+            # tracked 是畫面上實際畫出來的顆粒數（已扣掉被壽命門檻濾掉的）
+            l1 = (f"f{fi}  t={(fi - f0) / fps:6.2f}s  {s_.state.upper():5}  "
+                  f"tracked={int(s_.n_detected) - int(s_.n_short_track)}  "
+                  f"in_silo={int(s_.n_in_silo)}/{int(s_.n_in_silo_smooth)}  "
+                  f"left_cum={int(s_.n_drop_cum)}")
+            e_now = int(s_.event_id)
+            l2 = (f"event={'-' if e_now < 0 else e_now}   {prev_txt[fi]}")
+            cv2.rectangle(img, (0, 0), (size[0], 40), (0, 0, 0), -1)
+            cv2.putText(img, l1, (5, 15), 0, 0.46, col, 1, cv2.LINE_AA)
+            cv2.putText(img, l2, (5, 33), 0, 0.46, (255, 255, 255), 1, cv2.LINE_AA)
+        vw.write(img)
+    cap.release()
+    vw.release()
+
+
+# ==========================================================================
+# 主程式（partical_autoTrack 版）：按執行就跑
+# ==========================================================================
+# ---------------- 設定區 ----------------
+FOLDERS = FOLDERS = ["particle_Formal Experiment_ar3"]       # None = particle_lookup.csv 裡的全部資料夾
+                      # 只跑部分：["particle_Formal Experiment_ar2.5", "particle_Formal Experiment_ar3"]
+VIDEOS = None         # None = 全部影片；只跑某幾支：["IMG_0109.MOV", "2.0_1.mp4"]
+WORKERS = 6           # 同時跑幾支影片（8 核心的電腦建議 6–8）
+PROGRESS_EVERY_S = 10 # [v3] 平行跑時每隔幾秒印一次整體進度
+OVERLAY = "first"     # 追蹤影片 overlay.mp4："first" = 每個資料夾只輸出第一支、"all" = 每支都輸出（時間約加倍）、"none" = 都不輸出
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+LABELS_DIR = os.path.join(_HERE, "labels")        # 1_label.py 產生的標定檔
+OUT_DIR = os.path.join(_HERE, "analysis_count")   # [v3] 結果放這裡（新資料夾，舊的 analysis/ 不動）
+LOGS_DIR = os.path.join(_HERE, "logs")
+DONE_MARK = "video_summary.json"                  # _out 裡有這個檔 = 這支影片已經跑完
+
+
+def _plain(o):
+    """numpy 型別 → 一般 Python 型別（寫 json 用）。"""
+    if isinstance(o, np.generic):
+        return o.item()
+    raise TypeError(f"無法寫入 json：{type(o)}")
+
+
+def _run_job(job):
+    """一支影片。回傳 dict(ok, folder, video, ...)。失敗時帶回錯誤訊息與 traceback。"""
+    global QUIET
+    folder, json_path, video_path, out_dir, write_overlay, quiet, prog, key = job
+    QUIET = quiet
+
+    def progress(stage, done, total):
+        """[v3] 把進度寫進主程式共用的表格 prog（平行跑時才有），主程式會定時印出來。"""
+        if prog is not None:
+            try:
+                prog[key] = (stage, done, total, time.time())
+            except Exception:                   # 回報失敗不能害分析中斷
+                pass
+    lines = []
+
+    def log(msg=""):
+        if not quiet:
+            print(msg)
+        lines.append(msg)
+
+    t0 = time.time()
+    video = os.path.splitext(os.path.basename(json_path))[0]
+    # [2.2] 從讀標定檔到寫完 video_summary.json 全部包在 try 裡：任何一步出錯都只回報這一支失敗，
+    #       不會丟出例外把整批（和其他行程正在跑的影片）一起拖垮。
+    try:
+        cv2.setNumThreads(1)                   # 平行跑時每個行程只用一條執行緒，避免互搶
+        with open(json_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        video = cfg.get("video", video)
+        out_dir, ev, summary = analyze_one(video_path, cfg, log, out_dir,
+                                           do_overlay=write_overlay, legacy_scale=False,
+                                           progress=progress)
+        log(f"耗時 {time.time() - t0:.0f} s，輸出在 {os.path.basename(out_dir)}")
+        summary = dict(summary, folder=folder, seconds=time.time() - t0)
+        done_path = os.path.join(out_dir, DONE_MARK)
+        # [2.2] 寫入前先檢查：已經有 video_summary.json 代表別的執行已經寫過這支，
+        #       不覆寫它，也不改 summary.txt，只把這支記為失敗
+        if os.path.exists(done_path):
+            raise FileExistsError(f"{done_path} 已經存在（可能同時開了兩次程式），"
+                                  "這次的結果沒有寫入，原本的檔案保持不動")
+        with open(os.path.join(out_dir, "summary.txt"), "w", encoding="utf-8-sig") as f:
+            f.write("\n".join(lines))
+        # 最後才寫這個檔：它存在就代表這支影片完整跑完（3_plot.py 也是讀它）
+        with open(done_path, "x", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2, default=_plain)
+        return dict(ok=True, folder=folder, video=video, P_c=float(summary["P_c"]),
+                    flow=float(summary["flow_rate_count"]), n_events=int(summary["n_events"]),
+                    seconds=float(summary["seconds"]))
+    except Exception as e:
+        import traceback
+        return dict(ok=False, folder=folder, video=video,
+                    error_type=type(e).__name__, message=str(e),
+                    traceback=traceback.format_exc(limit=8), seconds=time.time() - t0)
+
+
+def main():
+    import datetime
+    import multiprocessing as mp
+    import common
+
+    if OVERLAY not in ("first", "all", "none"):
+        sys.exit('OVERLAY 只能是 "first"、"all" 或 "none"')
+    table, lookup_sha = common.load_lookup()
+    folders = FOLDERS if FOLDERS else list(table)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(LOGS_DIR, exist_ok=True)
+
+    jobs, no_labels, done, leftover = [], [], 0, []
+    n_frames = {}                                            # [v3] 每支影片要跑的幀數
+    for folder in folders:
+        meta = common.lookup_folder(table, folder)             # 查不到 → raise
+        ldir = os.path.join(LABELS_DIR, folder)
+        if not os.path.isdir(ldir):
+            no_labels.append(folder)
+            continue
+        first = True
+        for j in sorted(f for f in os.listdir(ldir) if f.lower().endswith(".json")):
+            jp = os.path.join(ldir, j)
+            with open(jp, encoding="utf-8") as f:
+                cfg = json.load(f)
+            if VIDEOS and cfg["video"] not in VIDEOS:
+                continue
+            # alpha / b_mm 必須和對照表一致（防止拿錯標定檔）
+            if abs(float(cfg["alpha"]) - meta["alpha"]) > 1e-9:
+                raise RuntimeError(f"{folder}/{j}：.json 的 alpha={cfg['alpha']} 與對照表 {meta['alpha']} 不符")
+            b_cfg = float(cfg["d_eq_mm"]) / np.sqrt(float(cfg["alpha"]))
+            if abs(b_cfg - meta["b_mm"]) > 1e-6:
+                raise RuntimeError(f"{folder}/{j}：.json 的 b={b_cfg:.4f} mm 與對照表 {meta['b_mm']} 不符")
+            # ROI 下緣必須蓋到「出口線 + 長半軸 + b」，否則出口下方的偵測範圍會被 ROI 切掉
+            # [v3] 新版標定檔只有 px_per_mm_preview、沒有 frame_height → 也接受；
+            #      frame_height 缺的話直接從影片讀
+            s_key = "px_per_mm" if "px_per_mm" in cfg else "px_per_mm_preview"
+            if s_key not in cfg:
+                raise RuntimeError(f"{folder}/{j} 不是 1_label.py 產生的標定檔（缺 px_per_mm）")
+            s_ = float(cfg[s_key])
+            if "frame_height" not in cfg:
+                _cap = cv2.VideoCapture(os.path.join(common.PROJECT, folder, cfg["video"]))
+                cfg["frame_height"] = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 10 ** 9
+                _cap.release()
+            yb = 0.5 * (cfg["silo"][1][1] + cfg["silo"][2][1])
+            need = min(float(cfg["frame_height"]), yb + (0.5 * meta["alpha"] * meta["b_mm"] + meta["b_mm"]) * s_)
+            if cfg["roi"][3] < need - 1.0:
+                raise RuntimeError(f"{folder}/{j}：ROI 下緣 y={cfg['roi'][3]} 不夠低（需要 ≥ {need:.0f}），"
+                                   "請用 1_label.py 重新產生這支的標定檔")
+            vp = os.path.join(common.PROJECT, folder, cfg["video"])
+            if not os.path.exists(vp):
+                raise RuntimeError(f"找不到影片 {vp}")
+            out_dir = os.path.join(OUT_DIR, folder, os.path.splitext(cfg["video"])[0] + "_out")
+            if os.path.exists(os.path.join(out_dir, DONE_MARK)):
+                done += 1
+                first = False                  # 這個資料夾已經有跑完的影片，"first" 模式不再輸出 overlay
+                continue
+            if os.path.isdir(out_dir):         # 上次跑到一半中斷留下的：不自動刪，請你確認後手動刪
+                leftover.append(out_dir)
+                continue
+            ov = OVERLAY == "all" or (OVERLAY == "first" and first)
+            first = False
+            # [v3] 這支影片要跑幾幀（算整體進度用）：.json 的範圍和影片實際長度取小的
+            _cap = cv2.VideoCapture(vp)
+            n_vid = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            _cap.release()
+            f_end = min(cfg["end_frame"], n_vid - 1) if n_vid > 0 else cfg["end_frame"]
+            if MAX_FRAMES:
+                f_end = min(f_end, cfg["start_frame"] + MAX_FRAMES - 1)
+            n_frames[f"{folder}/{cfg['video']}"] = max(1, f_end - cfg["start_frame"] + 1)
+            # 最後兩個欄位（共用進度表、這支的名稱）在下面開始跑之前才填
+            jobs.append((folder, jp, vp, out_dir, ov, WORKERS > 1, None, f"{folder}/{cfg['video']}"))
+
+    print(f"已跑完 {done} 支（跳過）、這次要跑 {len(jobs)} 支、{WORKERS} 個行程")
+    if no_labels:
+        print(f"沒有標定檔的資料夾（先跑 1_label.py）：{no_labels}")
+    if leftover:
+        print("下列資料夾是上次沒跑完留下的，這次不會處理。要重跑請先手動把它刪掉：")
+        for d in leftover:
+            print(f"    {d}")
+    if not jobs:
+        print("沒有需要分析的影片。")
+        return
+    manifest = dict(kind="track", created=stamp, code_hash=common.code_hash(), lookup_sha256=lookup_sha,
+                    lookup=table, labels_dir=LABELS_DIR, overlay=OVERLAY, workers=WORKERS,
+                    below_rule="0.5*a + 1.0*b", videos=[f"{j[0]}/{os.path.basename(j[2])}" for j in jobs],
+                    params=dict(CLOG_FRAMES=CLOG_FRAMES, EMPTY_N=EMPTY_N, DROP_FIRST_EVENT=DROP_FIRST_EVENT,
+                                MIN_EVENT_DROP=MIN_EVENT_DROP, COUNT_SMOOTH_FRAMES=COUNT_SMOOTH_FRAMES,
+                                COUNT_RISE_FRAMES=COUNT_RISE_FRAMES, MIN_TRACK_FRAMES=MIN_TRACK_FRAMES,
+                                CHANNEL=CHANNEL, WORK_B_PX=WORK_B_PX, SIZE_AUTO=SIZE_AUTO,
+                                MF_MIN_RESPONSE=MF_MIN_RESPONSE, MAX_OVERLAP=MAX_OVERLAP,
+                                MIN_COVERAGE=MIN_COVERAGE, SEAM_K=SEAM_K, V_MOVE_B_S=V_MOVE_B_S,
+                                MEMORY_FRAMES=MEMORY_FRAMES, ROLL_CORRECT=ROLL_CORRECT,
+                                SEARCH_PAD=SEARCH_PAD),
+                    versions=dict(python=sys.version.split()[0], cv2=cv2.__version__,
+                                  numpy=np.__version__, pandas=pd.__version__))
+    with open(os.path.join(LOGS_DIR, f"track_{stamp}.json"), "x", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    n_ok, fails = 0, []
+    t0 = time.time()
+
+    def report(k, r):
+        msg = (f"P_c={r['P_c']:.4f} Q={r['flow']:.1f} 顆/s 事件 {r['n_events']} ({r['seconds']:.0f}s)"
+               if r["ok"] else f"失敗 — {r['message']}")
+        print(f"[{k}/{len(jobs)}] {r['folder'][-6:]}/{r['video']}: {msg}  （累計 {time.time() - t0:.0f}s）")
+        sys.stdout.flush()
+
+    total_frames = sum(n_frames.values())
+    print(f"總共 {total_frames:,} 幀（約 {total_frames / 120 / 60:.1f} 分鐘的影片）")
+
+    def show_progress(prog, finished):
+        """[v3] 印一次整體進度：完成幾支、全部幀數的百分比、預估剩餘時間，
+        再逐支列出正在跑的影片跑到哪裡。
+        預估剩餘時間 = 已經花的時間 × (還沒跑的幀數 ÷ 已經跑完的幀數)。"""
+        snap = dict(prog)                                    # 先複製一份，避免讀到一半被改
+        done_frames = sum(n_frames[k] for k in finished)
+        done_frames += sum(v[1] for k, v in snap.items() if k not in finished)
+        el = time.time() - t0
+        frac = done_frames / total_frames if total_frames else 0
+        eta = f"預估還要 {fmt_dur(el * (1 - frac) / frac)}" if frac > 0.01 else "預估時間計算中"
+        print(f"[進度 {time.strftime('%H:%M:%S')}] 完成 {len(finished)}/{len(jobs)} 支｜"
+              f"全部 {frac:.0%}（{done_frames:,}/{total_frames:,} 幀）｜"
+              f"已經跑了 {fmt_dur(el)}｜{eta}")
+        for key, (stage, d, tot, _) in sorted(snap.items()):
+            if key in finished:
+                continue
+            print(f"    {key[-30:]:<30} {stage:<6} {d / tot:4.0%}（{d:,}/{tot:,} 幀）")
+        sys.stdout.flush()
+
+    if WORKERS > 1:
+        # [v3] 原本用 imap_unordered，主程式只能等下一支影片跑完；
+        #      改成 apply_async，主程式每 0.5 s 檢查一次，順便定時印出進度。
+        mgr = mp.Manager()
+        prog = mgr.dict()                                    # 各行程共用的進度表：名稱 → (階段, 已完成幀數, 總幀數, 時間)
+        jobs = [j[:6] + (prog, j[7]) for j in jobs]
+        finished = set()
+        with mp.Pool(WORKERS) as pool:
+            pending = {pool.apply_async(_run_job, (j,)): j for j in jobs}
+            last = time.time()
+            k = 0
+            while pending:
+                for ar in [a for a in pending if a.ready()]:
+                    j = pending.pop(ar)
+                    finished.add(j[7])
+                    k += 1
+                    try:
+                        r = ar.get()
+                    except Exception as e:             # [2.2] 行程本身出事（例如被強制結束）也只算這一支失敗
+                        r = dict(ok=False, folder=j[0], video=os.path.basename(j[2]),
+                                 error_type=type(e).__name__, message=str(e), traceback="", seconds=0.0)
+                    n_ok += r["ok"]
+                    if not r["ok"]:
+                        fails.append(r)
+                    report(k, r)
+                if time.time() - last >= PROGRESS_EVERY_S and pending:
+                    show_progress(prog, finished)
+                    last = time.time()
+                time.sleep(0.5)
+        mgr.shutdown()
+    else:
+        for k, job in enumerate(jobs, 1):
+            r = _run_job(job)
+            n_ok += r["ok"]
+            if not r["ok"]:
+                fails.append(r)
+            report(k, r)
+
+    if fails:
+        pd.DataFrame([{k: v for k, v in r.items() if k != "ok"} for r in fails]).to_csv(
+            os.path.join(LOGS_DIR, f"track_failures_{stamp}.csv"), index=False, encoding="utf-8-sig")
+        print(f"\n失敗的影片與原因：logs/track_failures_{stamp}.csv"
+              "\n（失敗的影片會留下不完整的 _out 資料夾，修正後要重跑請先手動刪掉它）")
+    print(f"\n成功 {n_ok}、失敗 {len(fails)}，耗時 {time.time() - t0:.0f} s\n結果在 {OUT_DIR}\n下一步：執行 3_plot.py")
+
+
+if __name__ == "__main__":
+    main()
